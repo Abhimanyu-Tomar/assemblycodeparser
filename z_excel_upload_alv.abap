@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Convert Hex using HR_RU_CONVERT_HEX_TO_STRING
+*& Description: Upload Excel, Hex->String (HR_RU..), Parse Data
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -14,13 +14,21 @@ TYPES: BEGIN OF ty_excel_raw,
          col_c TYPE string,      " Field 3
        END OF ty_excel_raw.
 
-* Output Structure - Includes all original columns + Converted Hex
+* Output Structure
 TYPES: BEGIN OF ty_final,
-         col_a         TYPE string,
-         col_b         TYPE string,      " Original Hex
-         col_c         TYPE string,
-         converted_xml TYPE string,      " Deserialized String
-         error_msg     TYPE string,
+         excel_id    TYPE string,
+         col_c       TYPE string,
+         ewoid       TYPE string,
+         status      TYPE string,
+         level       TYPE string,
+         shorttext   TYPE string,
+         decision_l2 TYPE string,
+         score_r     TYPE string,
+         score_g     TYPE string,
+         answer      TYPE string,
+         longtext    TYPE string,
+         xml_len     TYPE i,           " Debug: Length of decoded XML
+         error_msg   TYPE string,
        END OF ty_final.
 
 *----------------------------------------------------------------------*
@@ -130,19 +138,27 @@ FORM f_process_data.
         lv_clean_hex   TYPE string,
         lv_xstring     TYPE xstring,
         lv_xml_string  TYPE string,
+        lv_sub_off     TYPE i,
+        lv_match_off   TYPE i,
+        lv_end_off     TYPE i,
+        lv_str_start   TYPE i,
+        lv_str_len     TYPE i,
+        lv_found_items TYPE abap_bool,
+        lv_str_content TYPE string,
+        lt_parts       TYPE TABLE OF string,
+        lv_part        TYPE string,
+        lv_key         TYPE string,
+        lv_value       TYPE string,
         lv_len         TYPE i,
         lv_idx         TYPE i,
         lv_char        TYPE c.
 
   LOOP AT gt_excel_raw INTO ls_excel.
-    CLEAR: gs_final, lv_hex_string, lv_clean_hex, lv_xstring, lv_xml_string.
-    
-    " Map all original columns
-    gs_final-col_a = ls_excel-col_a.
-    gs_final-col_b = ls_excel-col_b.
-    gs_final-col_c = ls_excel-col_c.
+    CLEAR: gs_final, lv_hex_string, lv_clean_hex, lv_xstring, lv_xml_string, lv_found_items.
+    gs_final-excel_id = ls_excel-col_a.
+    gs_final-col_c    = ls_excel-col_c.
 
-    " Identify Hex Column (Assuming Col B, but check if empty)
+    " 1. Identify Hex Column
     IF strlen( ls_excel-col_b ) > 10.
       lv_hex_string = ls_excel-col_b.
     ELSEIF strlen( ls_excel-col_c ) > 10.
@@ -150,40 +166,98 @@ FORM f_process_data.
     ENDIF.
 
     IF lv_hex_string IS NOT INITIAL.
-      " Clean Hex String manually (remove newlines, spaces, etc.)
-      " This ensures HR_RU_CONVERT_HEX_TO_STRING receives valid input
-      lv_len = strlen( lv_hex_string ).
-      DO lv_len TIMES.
-        lv_idx = sy-index - 1.
-        lv_char = lv_hex_string+lv_idx(1).
-        IF lv_char CA '0123456789ABCDEFabcdef'.
-          CONCATENATE lv_clean_hex lv_char INTO lv_clean_hex.
-        ENDIF.
-      ENDDO.
+      " 2. Clean Hex String
+      REPLACE ALL OCCURRENCES OF REGEX '[^0-9A-Fa-f]' IN lv_hex_string WITH ''.
+      lv_clean_hex = lv_hex_string.
 
       IF lv_clean_hex IS NOT INITIAL.
+        " 3. Convert Hex -> XString
         TRY.
-            " Implicit conversion String -> XString
             lv_xstring = lv_clean_hex.
-
-            " Use the requested FM
-            CALL FUNCTION 'HR_RU_CONVERT_HEX_TO_STRING'
-              EXPORTING
-                xstring = lv_xstring
-              IMPORTING
-                cstring = lv_xml_string.
-
-            gs_final-converted_xml = lv_xml_string.
-
           CATCH cx_root.
-            gs_final-error_msg = 'Conversion Failed'.
+            gs_final-error_msg = 'Hex Conversion Failed'.
+            APPEND gs_final TO gt_final.
+            CONTINUE. 
         ENDTRY.
+
+        " 4. Convert using HR_RU_CONVERT_HEX_TO_STRING
+        CALL FUNCTION 'HR_RU_CONVERT_HEX_TO_STRING'
+          EXPORTING
+            xstring = lv_xstring
+          IMPORTING
+            cstring = lv_xml_string.
+
+        gs_final-xml_len = strlen( lv_xml_string ).
+
+        " 5. Parse XML Content (Extract Business Data)
+        lv_sub_off = 0.
+        WHILE 1 = 1.
+          " Find <STR>
+          FIND FIRST OCCURRENCE OF '<STR>' IN SECTION OFFSET lv_sub_off OF lv_xml_string 
+               MATCH OFFSET lv_match_off 
+               IGNORING CASE.
+          IF sy-subrc <> 0. EXIT. ENDIF.
+          
+          lv_str_start = lv_match_off + 5.
+
+          " Find </STR>
+          FIND FIRST OCCURRENCE OF '</STR>' IN SECTION OFFSET lv_str_start OF lv_xml_string 
+               MATCH OFFSET lv_end_off 
+               IGNORING CASE.
+          IF sy-subrc <> 0. EXIT. ENDIF.
+
+          lv_str_len = lv_end_off - lv_str_start.
+          lv_found_items = abap_true.
+          
+          " Extract Content
+          lv_str_content = substring( val = lv_xml_string off = lv_str_start len = lv_str_len ).
+
+          " Clear parsing fields
+          CLEAR: gs_final-ewoid, gs_final-status, gs_final-shorttext, 
+                 gs_final-decision_l2, gs_final-score_r, gs_final-score_g,
+                 gs_final-answer, gs_final-longtext.
+
+          " Parse Key==Value||...
+          REPLACE ALL OCCURRENCES OF '&lt;'   IN lv_str_content WITH '<' IGNORING CASE.
+          REPLACE ALL OCCURRENCES OF '&gt;'   IN lv_str_content WITH '>' IGNORING CASE.
+          REPLACE ALL OCCURRENCES OF '&amp;'  IN lv_str_content WITH '&' IGNORING CASE.
+          REPLACE ALL OCCURRENCES OF '&quot;' IN lv_str_content WITH '"' IGNORING CASE.
+
+          SPLIT lv_str_content AT '||' INTO TABLE lt_parts.
+          LOOP AT lt_parts INTO lv_part.
+            SPLIT lv_part AT '==' INTO lv_key lv_value.
+            CONDENSE lv_key.
+            CASE lv_key.
+              WHEN 'EWOID'.       gs_final-ewoid       = lv_value.
+              WHEN 'STATUS'.      gs_final-status      = lv_value.
+              WHEN 'LEVEL'.       gs_final-level       = lv_value.
+              WHEN 'SHORTTEXT'.   gs_final-shorttext   = lv_value.
+              WHEN 'DECISION_L2'. gs_final-decision_l2 = lv_value.
+              WHEN 'L2_SCORE_R'.  gs_final-score_r     = lv_value.
+              WHEN 'L2_SCORE_G'.  gs_final-score_g     = lv_value.
+              WHEN 'ANSWER'.      gs_final-answer      = lv_value.
+              WHEN 'LONGTEXT'.    gs_final-longtext    = lv_value.
+            ENDCASE.
+          ENDLOOP.
+
+          APPEND gs_final TO gt_final.
+          lv_sub_off = lv_end_off + 6. 
+        ENDWHILE.
+
+        IF lv_found_items = abap_false.
+            gs_final-error_msg = 'No Items found in XML'.
+            APPEND gs_final TO gt_final.
+        ENDIF.
+
       ELSE.
-        gs_final-error_msg = 'No valid Hex chars found'.
+        gs_final-error_msg = 'No valid Hex'.
+        APPEND gs_final TO gt_final.
       ENDIF.
+    ELSE.
+      " If no hex, just output original row
+      APPEND gs_final TO gt_final.
     ENDIF.
 
-    APPEND gs_final TO gt_final.
   ENDLOOP.
 ENDFORM.
 
@@ -206,24 +280,13 @@ FORM f_display_alv.
 
       lo_cols = lo_alv->get_columns( ).
       lo_cols->set_optimize( 'X' ).
-      
-      " Adjust column labels
+
+      " Labels
       TRY.
-          lo_col = lo_cols->get_column( 'COL_A' ).
-          lo_col->set_short_text( 'Col A' ).
-          
-          lo_col = lo_cols->get_column( 'COL_B' ).
-          lo_col->set_short_text( 'Col B (Hex)' ).
-          lo_col->set_visible( 'X' ). 
-
-          lo_col = lo_cols->get_column( 'COL_C' ).
-          lo_col->set_short_text( 'Col C' ).
-
-          lo_col = lo_cols->get_column( 'CONVERTED_XML' ).
-          lo_col->set_long_text( 'Converted String' ).
-          lo_col->set_medium_text( 'Converted' ).
-          lo_col->set_short_text( 'Conv' ).
-          lo_col->set_output_length( 100 ). 
+          lo_col = lo_cols->get_column( 'SHORTTEXT' ).
+          lo_col->set_output_length( 50 ).
+          lo_col = lo_cols->get_column( 'LONGTEXT' ).
+          lo_col->set_output_length( 50 ).
       CATCH cx_salv_not_found.
       ENDTRY.
 
