@@ -18,18 +18,15 @@ TYPES: BEGIN OF ty_excel_raw,
 TYPES: BEGIN OF ty_final,
          excel_id    TYPE string,      " From Col A
          xml_item_id TYPE string,      " From XML <ID>
-         ewoid       TYPE string,      " From STR
+         ewoid       TYPE string,
          status      TYPE string,
          level       TYPE string,
          shorttext   TYPE string,
-         answer      TYPE string,
-         longtext    TYPE string,
          decision_l2 TYPE string,
-         error       TYPE string,
          score_r     TYPE string,
          score_g     TYPE string,
-         valid_to    TYPE string,
          raw_str     TYPE string,      " Parsed STR for reference
+         error_msg   TYPE string,      " Debugging info
        END OF ty_final.
 
 *----------------------------------------------------------------------*
@@ -64,8 +61,17 @@ AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
 *----------------------------------------------------------------------*
 START-OF-SELECTION.
   PERFORM f_upload_excel.
-  PERFORM f_process_data.
-  PERFORM f_display_alv.
+  
+  IF gt_excel_raw IS INITIAL.
+    MESSAGE 'No data found in Excel file.' TYPE 'S' DISPLAY LIKE 'E'.
+  ELSE.
+    PERFORM f_process_data.
+    IF gt_final IS INITIAL.
+      MESSAGE 'Excel uploaded but no XML data could be extracted. Check format.' TYPE 'S' DISPLAY LIKE 'E'.
+    ELSE.
+      PERFORM f_display_alv.
+    ENDIF.
+  ENDIF.
 
 *&---------------------------------------------------------------------*
 *& Form f_file_open
@@ -149,22 +155,30 @@ FORM f_process_data.
         lv_part       TYPE string,
         lv_key        TYPE string,
         lv_value      TYPE string,
-        lo_conv       TYPE REF TO cl_abap_conv_in_ce.
+        lo_conv       TYPE REF TO cl_abap_conv_in_ce,
+        lv_found_items TYPE abap_bool.
 
   lo_ixml = cl_ixml=>create( ).
   lo_stream_factory = lo_ixml->create_stream_factory( ).
 
   LOOP AT gt_excel_raw INTO ls_excel.
-    CLEAR: lv_hex_string.
+    CLEAR: lv_hex_string, gs_final, lv_found_items.
+    gs_final-excel_id = ls_excel-col_a.
     
-    " Determine Hex Column (Assuming it contains Hex characters)
-    IF ls_excel-col_b IS NOT INITIAL AND ls_excel-col_b CO '0123456789ABCDEFabcdef'.
+    " Clean and Determine Hex Column
+    " Remove whitespaces that might break conversion
+    CONDENSE ls_excel-col_b NO-GAPS.
+    CONDENSE ls_excel-col_c NO-GAPS.
+
+    IF ls_excel-col_b IS NOT INITIAL AND strlen( ls_excel-col_b ) > 10.
       lv_hex_string = ls_excel-col_b.
-    ELSEIF ls_excel-col_c IS NOT INITIAL AND ls_excel-col_c CO '0123456789ABCDEFabcdef'.
+    ELSEIF ls_excel-col_c IS NOT INITIAL AND strlen( ls_excel-col_c ) > 10.
       lv_hex_string = ls_excel-col_c.
     ENDIF.
 
     IF lv_hex_string IS INITIAL.
+      gs_final-error_msg = 'No Hex Data Found'.
+      APPEND gs_final TO gt_final.
       CONTINUE.
     ENDIF.
 
@@ -172,6 +186,8 @@ FORM f_process_data.
     TRY.
         lv_xstring = lv_hex_string.
       CATCH cx_root.
+        gs_final-error_msg = 'Hex Conversion Failed'.
+        APPEND gs_final TO gt_final.
         CONTINUE. 
     ENDTRY.
 
@@ -180,6 +196,8 @@ FORM f_process_data.
         lo_conv = cl_abap_conv_in_ce=>create( input = lv_xstring encoding = 'UTF-8' ).
         lo_conv->read( IMPORTING data = lv_xml_string ).
       CATCH cx_root.
+        gs_final-error_msg = 'UTF-8 Conversion Failed'.
+        APPEND gs_final TO gt_final.
         CONTINUE.
     ENDTRY.
 
@@ -191,61 +209,68 @@ FORM f_process_data.
                                         document       = lo_document ).
     
     IF lo_parser->parse( ) <> 0.
-      CONTINUE. " XML Parse Error
+       gs_final-error_msg = 'XML Parse Failed'.
+       APPEND gs_final TO gt_final.
+       CONTINUE.
     ENDIF.
 
     " 4. Extract <item> elements
     lo_items = lo_document->get_elements_by_tag_name( name = 'item' ).
-    lo_iterator = lo_items->create_iterator( ).
-    lo_node = lo_iterator->get_next( ).
+    IF lo_items IS BOUND.
+        lo_iterator = lo_items->create_iterator( ).
+        lo_node = lo_iterator->get_next( ).
 
-    WHILE lo_node IS BOUND.
-      CLEAR: gs_final, lv_item_id, lv_str_content.
-      gs_final-excel_id = ls_excel-col_a.
+        WHILE lo_node IS BOUND.
+          lv_found_items = abap_true.
+          CLEAR: gs_final-xml_item_id, gs_final-raw_str, 
+                 gs_final-ewoid, gs_final-status, gs_final-shorttext.
+          
+          gs_final-excel_id = ls_excel-col_a.
 
-      " Get Children of <item> (ID and STR)
-      lo_children = lo_node->get_children( ).
-      DO lo_children->get_length( ) TIMES.
-        lo_child_node = lo_children->get_item( index = sy-index - 1 ).
-        CASE lo_child_node->get_name( ).
-          WHEN 'ID'.
-            lv_item_id = lo_child_node->get_value( ).
-          WHEN 'STR'.
-            lv_str_content = lo_child_node->get_value( ).
-        ENDCASE.
-      ENDDO.
+          " Get Children of <item> (ID and STR)
+          lo_children = lo_node->get_children( ).
+          DO lo_children->get_length( ) TIMES.
+            lo_child_node = lo_children->get_item( index = sy-index - 1 ).
+            CASE lo_child_node->get_name( ).
+              WHEN 'ID'.
+                lv_item_id = lo_child_node->get_value( ).
+              WHEN 'STR'.
+                lv_str_content = lo_child_node->get_value( ).
+            ENDCASE.
+          ENDDO.
 
-      gs_final-xml_item_id = lv_item_id.
-      gs_final-raw_str     = lv_str_content.
+          gs_final-xml_item_id = lv_item_id.
+          gs_final-raw_str     = lv_str_content.
 
-      " 5. Parse STR content: Key==Value||Key==Value
-      SPLIT lv_str_content AT '||' INTO TABLE lt_parts.
-      
-      LOOP AT lt_parts INTO lv_part.
-        SPLIT lv_part AT '==' INTO lv_key lv_value.
-        CONDENSE lv_key.
-        
-        CASE lv_key.
-          WHEN 'EWOID'.       gs_final-ewoid       = lv_value.
-          WHEN 'STATUS'.      gs_final-status      = lv_value.
-          WHEN 'LEVEL'.       gs_final-level       = lv_value.
-          WHEN 'SHORTTEXT'.   gs_final-shorttext   = lv_value.
-          WHEN 'ANSWER'.      gs_final-answer      = lv_value.
-          WHEN 'LONGTEXT'.    gs_final-longtext    = lv_value.
-          WHEN 'DECISION_L2'. gs_final-decision_l2 = lv_value.
-          WHEN 'ERROR'.       gs_final-error       = lv_value.
-          WHEN 'L2_SCORE_R'.  gs_final-score_r     = lv_value.
-          WHEN 'L2_SCORE_G'.  gs_final-score_g     = lv_value.
-          WHEN 'SCORE_YES_R'. IF gs_final-score_r IS INITIAL. gs_final-score_r = lv_value. ENDIF.
-          WHEN 'SCORE_YES_G'. IF gs_final-score_g IS INITIAL. gs_final-score_g = lv_value. ENDIF.
-          WHEN 'VALID_TO'.    gs_final-valid_to    = lv_value.
-        ENDCASE.
-      ENDLOOP.
+          " 5. Parse STR content: Key==Value||Key==Value
+          SPLIT lv_str_content AT '||' INTO TABLE lt_parts.
+          
+          LOOP AT lt_parts INTO lv_part.
+            SPLIT lv_part AT '==' INTO lv_key lv_value.
+            CONDENSE lv_key.
+            
+            CASE lv_key.
+              WHEN 'EWOID'.       gs_final-ewoid       = lv_value.
+              WHEN 'STATUS'.      gs_final-status      = lv_value.
+              WHEN 'LEVEL'.       gs_final-level       = lv_value.
+              WHEN 'SHORTTEXT'.   gs_final-shorttext   = lv_value.
+              WHEN 'DECISION_L2'. gs_final-decision_l2 = lv_value.
+              WHEN 'L2_SCORE_R'.  gs_final-score_r     = lv_value.
+              WHEN 'L2_SCORE_G'.  gs_final-score_g     = lv_value.
+              WHEN 'SCORE_YES_R'. IF gs_final-score_r IS INITIAL. gs_final-score_r = lv_value. ENDIF.
+              WHEN 'SCORE_YES_G'. IF gs_final-score_g IS INITIAL. gs_final-score_g = lv_value. ENDIF.
+            ENDCASE.
+          ENDLOOP.
 
-      APPEND gs_final TO gt_final.
-      
-      lo_node = lo_iterator->get_next( ).
-    ENDWHILE.
+          APPEND gs_final TO gt_final.
+          lo_node = lo_iterator->get_next( ).
+        ENDWHILE.
+    ENDIF.
+    
+    IF lv_found_items = abap_false.
+        gs_final-error_msg = 'No Items found in XML'.
+        APPEND gs_final TO gt_final.
+    ENDIF.
 
   ENDLOOP.
 ENDFORM.
@@ -256,7 +281,8 @@ ENDFORM.
 FORM f_display_alv.
   DATA: lo_alv TYPE REF TO cl_salv_table,
         lo_msg TYPE REF TO cx_salv_msg,
-        lo_cols TYPE REF TO cl_salv_columns_table.
+        lo_cols TYPE REF TO cl_salv_columns_table,
+        lo_col  TYPE REF TO cl_salv_column.
 
   TRY.
       cl_salv_table=>factory(
@@ -268,6 +294,13 @@ FORM f_display_alv.
 
       lo_cols = lo_alv->get_columns( ).
       lo_cols->set_optimize( 'X' ).
+
+      " Set Column Headers
+      TRY.
+        lo_col = lo_cols->get_column( 'RAW_STR' ).
+        lo_col->set_visible( ' ' ). " Hide raw string if too long
+      CATCH cx_salv_not_found.
+      ENDTRY.
 
       lo_alv->display( ).
 
