@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Parse Pipe-Delimited String, Display ALV
+*& Description: Upload Excel, Decode Hex XML, Parse Data, Display ALV
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -9,23 +9,27 @@ REPORT z_excel_upload_alv.
 * Types Declaration
 *----------------------------------------------------------------------*
 TYPES: BEGIN OF ty_excel_raw,
-         col_a TYPE string,      " Field 1 (ID)
-         col_b TYPE string,      " Field 2 (Possibly Empty in some views)
-         col_c TYPE string,      " Field 3 (Complex String)
+         col_a TYPE string,      " Field 1
+         col_b TYPE string,      " Field 2 (Hex String)
+         col_c TYPE string,      " Field 3
        END OF ty_excel_raw.
 
 * Final Output Structure for ALV
 TYPES: BEGIN OF ty_final,
-         id          TYPE string,      " From Col A
-         " Parsed fields from string
-         segment_1   TYPE string,
-         segment_2   TYPE string,
-         segment_3   TYPE string,
-         segment_4   TYPE string,
-         segment_5   TYPE string,
-         suffix      TYPE string,
-         " Raw data for reference
-         raw_string  TYPE string,
+         excel_id    TYPE string,      " From Col A
+         xml_item_id TYPE string,      " From XML <ID>
+         ewoid       TYPE string,      " From STR
+         status      TYPE string,
+         level       TYPE string,
+         shorttext   TYPE string,
+         answer      TYPE string,
+         longtext    TYPE string,
+         decision_l2 TYPE string,
+         error       TYPE string,
+         score_r     TYPE string,
+         score_g     TYPE string,
+         valid_to    TYPE string,
+         raw_str     TYPE string,      " Parsed STR for reference
        END OF ty_final.
 
 *----------------------------------------------------------------------*
@@ -125,55 +129,124 @@ ENDFORM.
 *& Form f_process_data
 *&---------------------------------------------------------------------*
 FORM f_process_data.
-  DATA: ls_excel    LIKE LINE OF gt_excel_raw,
-        lv_raw      TYPE string,
-        lt_segments TYPE TABLE OF string,
-        lv_count    TYPE i.
+  DATA: ls_excel      LIKE LINE OF gt_excel_raw,
+        lv_hex_string TYPE string,
+        lv_xstring    TYPE xstring,
+        lv_xml_string TYPE string,
+        lo_ixml       TYPE REF TO if_ixml,
+        lo_stream_factory TYPE REF TO if_ixml_stream_factory,
+        lo_istream    TYPE REF TO if_ixml_istream,
+        lo_document   TYPE REF TO if_ixml_document,
+        lo_parser     TYPE REF TO if_ixml_parser,
+        lo_items      TYPE REF TO if_ixml_node_collection,
+        lo_iterator   TYPE REF TO if_ixml_node_iterator,
+        lo_node       TYPE REF TO if_ixml_node,
+        lo_child_node TYPE REF TO if_ixml_node,
+        lo_children   TYPE REF TO if_ixml_node_list,
+        lv_item_id    TYPE string,
+        lv_str_content TYPE string,
+        lt_parts      TYPE TABLE OF string,
+        lv_part       TYPE string,
+        lv_key        TYPE string,
+        lv_value      TYPE string,
+        lo_conv       TYPE REF TO cl_abap_conv_in_ce.
+
+  lo_ixml = cl_ixml=>create( ).
+  lo_stream_factory = lo_ixml->create_stream_factory( ).
 
   LOOP AT gt_excel_raw INTO ls_excel.
-    CLEAR: gs_final, lv_raw, lt_segments.
-
-    gs_final-id = ls_excel-col_a.
-
-    " Determine which column holds the complex string
-    " Based on the user screenshot, it might be in Col C if Col B is empty
-    IF ls_excel-col_b IS NOT INITIAL AND ls_excel-col_b CA '|;'.
-      lv_raw = ls_excel-col_b.
-    ELSEIF ls_excel-col_c IS NOT INITIAL.
-      lv_raw = ls_excel-col_c.
-    ELSE.
-      " Fallback: use Col B if Col C is empty, even if Col B doesn't look complex
-      lv_raw = ls_excel-col_b.
+    CLEAR: lv_hex_string.
+    
+    " Determine Hex Column (Assuming it contains Hex characters)
+    IF ls_excel-col_b IS NOT INITIAL AND ls_excel-col_b CO '0123456789ABCDEFabcdef'.
+      lv_hex_string = ls_excel-col_b.
+    ELSEIF ls_excel-col_c IS NOT INITIAL AND ls_excel-col_c CO '0123456789ABCDEFabcdef'.
+      lv_hex_string = ls_excel-col_c.
     ENDIF.
 
-    gs_final-raw_string = lv_raw.
+    IF lv_hex_string IS INITIAL.
+      CONTINUE.
+    ENDIF.
 
-    " Logic to parse the string: Split by Pipe (|)
-    IF lv_raw IS NOT INITIAL.
-      SPLIT lv_raw AT '|' INTO TABLE lt_segments.
+    " 1. Convert Hex String to XString (Binary)
+    TRY.
+        lv_xstring = lv_hex_string.
+      CATCH cx_root.
+        CONTINUE. 
+    ENDTRY.
+
+    " 2. Convert XString to XML String (UTF-8)
+    TRY.
+        lo_conv = cl_abap_conv_in_ce=>create( input = lv_xstring encoding = 'UTF-8' ).
+        lo_conv->read( IMPORTING data = lv_xml_string ).
+      CATCH cx_root.
+        CONTINUE.
+    ENDTRY.
+
+    " 3. Parse XML
+    lo_document = lo_ixml->create_document( ).
+    lo_istream = lo_stream_factory->create_istream_string( lv_xml_string ).
+    lo_parser = lo_ixml->create_parser( stream_factory = lo_stream_factory
+                                        istream        = lo_istream
+                                        document       = lo_document ).
+    
+    IF lo_parser->parse( ) <> 0.
+      CONTINUE. " XML Parse Error
+    ENDIF.
+
+    " 4. Extract <item> elements
+    lo_items = lo_document->get_elements_by_tag_name( name = 'item' ).
+    lo_iterator = lo_items->create_iterator( ).
+    lo_node = lo_iterator->get_next( ).
+
+    WHILE lo_node IS BOUND.
+      CLEAR: gs_final, lv_item_id, lv_str_content.
+      gs_final-excel_id = ls_excel-col_a.
+
+      " Get Children of <item> (ID and STR)
+      lo_children = lo_node->get_children( ).
+      DO lo_children->get_length( ) TIMES.
+        lo_child_node = lo_children->get_item( index = sy-index - 1 ).
+        CASE lo_child_node->get_name( ).
+          WHEN 'ID'.
+            lv_item_id = lo_child_node->get_value( ).
+          WHEN 'STR'.
+            lv_str_content = lo_child_node->get_value( ).
+        ENDCASE.
+      ENDDO.
+
+      gs_final-xml_item_id = lv_item_id.
+      gs_final-raw_str     = lv_str_content.
+
+      " 5. Parse STR content: Key==Value||Key==Value
+      SPLIT lv_str_content AT '||' INTO TABLE lt_parts.
       
-      " Map segments to fields
-      DESCRIBE TABLE lt_segments LINES lv_count.
-      
-      LOOP AT lt_segments INTO DATA(lv_segment).
-        CASE sy-tabix.
-          WHEN 1. gs_final-segment_1 = lv_segment.
-          WHEN 2. gs_final-segment_2 = lv_segment.
-          WHEN 3. gs_final-segment_3 = lv_segment.
-          WHEN 4. gs_final-segment_4 = lv_segment.
-          WHEN 5. gs_final-segment_5 = lv_segment.
-          " The last segment often contains the suffix (Company Name etc)
-          " If there are many segments, the last one might be special
+      LOOP AT lt_parts INTO lv_part.
+        SPLIT lv_part AT '==' INTO lv_key lv_value.
+        CONDENSE lv_key.
+        
+        CASE lv_key.
+          WHEN 'EWOID'.       gs_final-ewoid       = lv_value.
+          WHEN 'STATUS'.      gs_final-status      = lv_value.
+          WHEN 'LEVEL'.       gs_final-level       = lv_value.
+          WHEN 'SHORTTEXT'.   gs_final-shorttext   = lv_value.
+          WHEN 'ANSWER'.      gs_final-answer      = lv_value.
+          WHEN 'LONGTEXT'.    gs_final-longtext    = lv_value.
+          WHEN 'DECISION_L2'. gs_final-decision_l2 = lv_value.
+          WHEN 'ERROR'.       gs_final-error       = lv_value.
+          WHEN 'L2_SCORE_R'.  gs_final-score_r     = lv_value.
+          WHEN 'L2_SCORE_G'.  gs_final-score_g     = lv_value.
+          WHEN 'SCORE_YES_R'. IF gs_final-score_r IS INITIAL. gs_final-score_r = lv_value. ENDIF.
+          WHEN 'SCORE_YES_G'. IF gs_final-score_g IS INITIAL. gs_final-score_g = lv_value. ENDIF.
+          WHEN 'VALID_TO'.    gs_final-valid_to    = lv_value.
         ENDCASE.
       ENDLOOP.
-      
-      " Optional: If the string has NO pipes, put it all in Segment 1
-      IF lv_count = 0.
-         gs_final-segment_1 = lv_raw.
-      ENDIF.
-    ENDIF.
 
-    APPEND gs_final TO gt_final.
+      APPEND gs_final TO gt_final.
+      
+      lo_node = lo_iterator->get_next( ).
+    ENDWHILE.
+
   ENDLOOP.
 ENDFORM.
 
@@ -183,8 +256,7 @@ ENDFORM.
 FORM f_display_alv.
   DATA: lo_alv TYPE REF TO cl_salv_table,
         lo_msg TYPE REF TO cx_salv_msg,
-        lo_cols TYPE REF TO cl_salv_columns_table,
-        lo_col  TYPE REF TO cl_salv_column.
+        lo_cols TYPE REF TO cl_salv_columns_table.
 
   TRY.
       cl_salv_table=>factory(
@@ -196,21 +268,6 @@ FORM f_display_alv.
 
       lo_cols = lo_alv->get_columns( ).
       lo_cols->set_optimize( 'X' ).
-
-      " Rename columns for better readability
-      TRY.
-          lo_col = lo_cols->get_column( 'SEGMENT_1' ).
-          lo_col->set_long_text( 'Data Segment 1' ).
-          lo_col->set_medium_text( 'Segment 1' ).
-          lo_col->set_short_text( 'Seg 1' ).
-
-          lo_col = lo_cols->get_column( 'SEGMENT_2' ).
-          lo_col->set_long_text( 'Data Segment 2' ).
-
-          lo_col = lo_cols->get_column( 'RAW_STRING' ).
-          lo_col->set_long_text( 'Original String' ).
-        CATCH cx_salv_not_found.
-      ENDTRY.
 
       lo_alv->display( ).
 
