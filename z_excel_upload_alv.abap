@@ -138,6 +138,12 @@ FORM f_process_data.
         lv_sub_off     TYPE i,
         lv_match_off   TYPE i,
         lv_match_len   TYPE i,
+        lv_end_off     TYPE i,
+        lv_str_start   TYPE i,
+        lv_str_len     TYPE i,
+        lv_id_start    TYPE i,
+        lv_id_end      TYPE i,
+        lv_id_len      TYPE i,
         lv_found_items TYPE abap_bool,
         lv_str_content TYPE string,
         lt_parts       TYPE TABLE OF string,
@@ -181,41 +187,67 @@ FORM f_process_data.
         CONTINUE.
     ENDTRY.
 
-    " Parse the Decoded String (XML-like)
-    " Robust Search for <STR>...</STR> blocks
+    " Parse the Decoded String (Manual FIND to avoid Regex issues)
     lv_sub_off = 0.
     WHILE 1 = 1.
-      FIND REGEX '<STR>(.*?)</STR>' IN SECTION OFFSET lv_sub_off OF lv_xml_string
-           MATCH OFFSET lv_match_off
-           MATCH LENGTH lv_match_len
-           IGNORING CASE.
-      
+      " Find <STR>
+      FIND FIRST OCCURRENCE OF '<STR>' IN SECTION OFFSET lv_sub_off OF lv_xml_string MATCH OFFSET lv_match_off.
       IF sy-subrc <> 0.
-        EXIT. 
+        EXIT.
+      ENDIF.
+      
+      lv_str_start = lv_match_off + 5. " Len of <STR>
+
+      " Find </STR>
+      FIND FIRST OCCURRENCE OF '</STR>' IN SECTION OFFSET lv_str_start OF lv_xml_string MATCH OFFSET lv_end_off.
+      IF sy-subrc <> 0.
+        EXIT.
       ENDIF.
 
+      lv_str_len = lv_end_off - lv_str_start.
       lv_found_items = abap_true.
       
-      " Extract Content: MatchOffset + 5 (len of <STR>), Length = MatchLen - 11 (len of <STR></STR>)
-      lv_str_content = substring( val = lv_xml_string off = lv_match_off + 5 len = lv_match_len - 11 ).
-      gs_final-raw_str = lv_str_content. " Save for reference
+      " Extract Content
+      lv_str_content = substring( val = lv_xml_string off = lv_str_start len = lv_str_len ).
+      gs_final-raw_str = lv_str_content.
 
       " Reset fields for new item
       CLEAR: gs_final-ewoid, gs_final-status, gs_final-shorttext, gs_final-xml_item_id,
              gs_final-decision_l2, gs_final-score_r, gs_final-score_g.
 
-      " Attempt to find ID for this block (Look backwards from STR pos)
-      " Simple heuristic: Find last <ID> before this <STR>
-      DATA: lv_id_match_off TYPE i, lv_id_match_len TYPE i.
-      FIND REGEX '<ID>(.*?)</ID>' IN SECTION OFFSET 0 LENGTH lv_match_off OF lv_xml_string
-           MATCH OFFSET lv_id_match_off
-           MATCH LENGTH lv_id_match_len
-           IGNORING CASE.
-      IF sy-subrc = 0.
-         " If multiple IDs exist, this finds the *first* one in the block. 
-         " For strict XML matching, we'd need loop logic, but this often suffices for sequential data.
-         " Better approach: Search in the small chunk between previous STR end and current STR start.
-         gs_final-xml_item_id = substring( val = lv_xml_string off = lv_id_match_off + 4 len = lv_id_match_len - 9 ).
+      " Find ID (Manually backwards or just general search)
+      " We will search for <ID>...<ID> *before* the current <STR>
+      " For simplicity in sequential processing: 
+      " Find last <ID> before current <STR> offset
+      DATA: lv_search_len TYPE i.
+      lv_search_len = lv_match_off. " Search from 0 up to <STR> start
+      
+      " Since we can't easily 'Find Last' in all versions without Regex, 
+      " we assume the ID is reasonably close. Let's scan from 0.
+      DATA: lv_temp_off TYPE i, lv_last_id_start TYPE i, lv_last_id_end TYPE i.
+      CLEAR: lv_last_id_start, lv_last_id_end.
+      lv_temp_off = 0.
+      
+      " Find all IDs up to the current STR position, take the last one
+      WHILE 1 = 1.
+        FIND FIRST OCCURRENCE OF '<ID>' IN SECTION OFFSET lv_temp_off LENGTH ( lv_search_len - lv_temp_off ) OF lv_xml_string MATCH OFFSET lv_id_start.
+        IF sy-subrc <> 0.
+          EXIT.
+        ENDIF.
+        
+        FIND FIRST OCCURRENCE OF '</ID>' IN SECTION OFFSET ( lv_id_start + 4 ) LENGTH ( lv_search_len - lv_id_start - 4 ) OF lv_xml_string MATCH OFFSET lv_id_end.
+        IF sy-subrc <> 0.
+           EXIT.
+        ENDIF.
+        
+        lv_last_id_start = lv_id_start + 4.
+        lv_last_id_end   = lv_id_end.
+        lv_temp_off      = lv_id_end + 5. " Advance past </ID>
+      ENDWHILE.
+
+      IF lv_last_id_start > 0.
+         lv_id_len = lv_last_id_end - lv_last_id_start.
+         gs_final-xml_item_id = substring( val = lv_xml_string off = lv_last_id_start len = lv_id_len ).
       ENDIF.
 
       " Parse Key==Value||...
@@ -239,7 +271,9 @@ FORM f_process_data.
       ENDLOOP.
 
       APPEND gs_final TO gt_final.
-      lv_sub_off = lv_match_off + lv_match_len.
+      
+      " Advance offset past current </STR>
+      lv_sub_off = lv_end_off + 6. " + len of </STR>
     ENDWHILE.
 
     IF lv_found_items = abap_false.
