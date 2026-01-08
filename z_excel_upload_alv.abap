@@ -25,7 +25,6 @@ TYPES: BEGIN OF ty_final,
          decision_l2 TYPE string,
          score_r     TYPE string,
          score_g     TYPE string,
-         raw_str     TYPE string,      " Parsed STR for reference
          error_msg   TYPE string,      " Debugging info
        END OF ty_final.
 
@@ -67,7 +66,7 @@ START-OF-SELECTION.
   ELSE.
     PERFORM f_process_data.
     IF gt_final IS INITIAL.
-      MESSAGE 'Excel uploaded but no XML data could be extracted. Check format.' TYPE 'S' DISPLAY LIKE 'E'.
+      MESSAGE 'Excel uploaded but no valid data extracted.' TYPE 'S' DISPLAY LIKE 'E'.
     ELSE.
       PERFORM f_display_alv.
     ENDIF.
@@ -138,7 +137,6 @@ FORM f_process_data.
   DATA: ls_excel      LIKE LINE OF gt_excel_raw,
         lv_hex_string TYPE string,
         lv_xstring    TYPE xstring,
-        lv_xml_string TYPE string,
         lo_ixml       TYPE REF TO if_ixml,
         lo_stream_factory TYPE REF TO if_ixml_stream_factory,
         lo_istream    TYPE REF TO if_ixml_istream,
@@ -155,14 +153,13 @@ FORM f_process_data.
         lv_part       TYPE string,
         lv_key        TYPE string,
         lv_value      TYPE string,
-        lo_conv       TYPE REF TO cl_abap_conv_in_ce,
         lv_found_items TYPE abap_bool.
 
   lo_ixml = cl_ixml=>create( ).
   lo_stream_factory = lo_ixml->create_stream_factory( ).
 
   LOOP AT gt_excel_raw INTO ls_excel.
-    CLEAR: lv_hex_string, gs_final, lv_found_items.
+    CLEAR: lv_hex_string, gs_final, lv_found_items, lv_xstring.
     gs_final-excel_id = ls_excel-col_a.
     
     " Clean and Determine Hex Column
@@ -170,6 +167,7 @@ FORM f_process_data.
     CONDENSE ls_excel-col_b NO-GAPS.
     CONDENSE ls_excel-col_c NO-GAPS.
 
+    " Basic heuristic to find the long hex string
     IF ls_excel-col_b IS NOT INITIAL AND strlen( ls_excel-col_b ) > 10.
       lv_hex_string = ls_excel-col_b.
     ELSEIF ls_excel-col_c IS NOT INITIAL AND strlen( ls_excel-col_c ) > 10.
@@ -191,30 +189,24 @@ FORM f_process_data.
         CONTINUE. 
     ENDTRY.
 
-    " 2. Convert XString to XML String (UTF-8)
-    TRY.
-        lo_conv = cl_abap_conv_in_ce=>create( input = lv_xstring encoding = 'UTF-8' ).
-        lo_conv->read( IMPORTING data = lv_xml_string ).
-      CATCH cx_root.
-        gs_final-error_msg = 'UTF-8 Conversion Failed'.
-        APPEND gs_final TO gt_final.
-        CONTINUE.
-    ENDTRY.
-
-    " 3. Parse XML
+    " 2. Parse XML directly from XSTRING
+    " This is critical: passing XSTRING allows the parser to detect encoding (UTF-8) correctly
+    " from the XML header, whereas passing a String often causes conflict.
     lo_document = lo_ixml->create_document( ).
-    lo_istream = lo_stream_factory->create_istream_string( lv_xml_string ).
+    lo_istream = lo_stream_factory->create_istream_xstring( lv_xstring ).
     lo_parser = lo_ixml->create_parser( stream_factory = lo_stream_factory
                                         istream        = lo_istream
                                         document       = lo_document ).
     
     IF lo_parser->parse( ) <> 0.
-       gs_final-error_msg = 'XML Parse Failed'.
+       " If strict parsing fails, it might be due to minor XML issues.
+       " We just report failure here.
+       gs_final-error_msg = 'XML Parse Failed (Invalid XML Structure)'.
        APPEND gs_final TO gt_final.
        CONTINUE.
     ENDIF.
 
-    " 4. Extract <item> elements
+    " 3. Extract <item> elements
     lo_items = lo_document->get_elements_by_tag_name( name = 'item' ).
     IF lo_items IS BOUND.
         lo_iterator = lo_items->create_iterator( ).
@@ -222,8 +214,9 @@ FORM f_process_data.
 
         WHILE lo_node IS BOUND.
           lv_found_items = abap_true.
-          CLEAR: gs_final-xml_item_id, gs_final-raw_str, 
-                 gs_final-ewoid, gs_final-status, gs_final-shorttext.
+          CLEAR: gs_final-xml_item_id, 
+                 gs_final-ewoid, gs_final-status, gs_final-shorttext,
+                 gs_final-decision_l2, gs_final-score_r, gs_final-score_g.
           
           gs_final-excel_id = ls_excel-col_a.
 
@@ -240,9 +233,8 @@ FORM f_process_data.
           ENDDO.
 
           gs_final-xml_item_id = lv_item_id.
-          gs_final-raw_str     = lv_str_content.
 
-          " 5. Parse STR content: Key==Value||Key==Value
+          " 4. Parse STR content: Key==Value||Key==Value
           SPLIT lv_str_content AT '||' INTO TABLE lt_parts.
           
           LOOP AT lt_parts INTO lv_part.
@@ -294,13 +286,6 @@ FORM f_display_alv.
 
       lo_cols = lo_alv->get_columns( ).
       lo_cols->set_optimize( 'X' ).
-
-      " Set Column Headers
-      TRY.
-        lo_col = lo_cols->get_column( 'RAW_STR' ).
-        lo_col->set_visible( ' ' ). " Hide raw string if too long
-      CATCH cx_salv_not_found.
-      ENDTRY.
 
       lo_alv->display( ).
 
