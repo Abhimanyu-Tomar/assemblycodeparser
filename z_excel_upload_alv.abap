@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Convert Hex using HR_RU_CONVERT_HEX_TO_STRING
+*& Description: Upload Excel, Hex->String, Format XML (Pretty Print)
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -17,7 +17,7 @@ TYPES: BEGIN OF ty_excel_raw,
 * Output Structure
 TYPES: BEGIN OF ty_final,
          col_a     TYPE string,
-         converted TYPE string,      " Readable String
+         converted TYPE string,      " Formatted XML
          col_c     TYPE string,
          error_msg TYPE string,
        END OF ty_final.
@@ -129,17 +129,29 @@ FORM f_process_data.
         lv_clean_hex   TYPE string,
         lv_xstring     TYPE xstring,
         lv_xml_string  TYPE string,
+        lv_xml_pretty  TYPE string,
         lv_len         TYPE i,
         lv_idx         TYPE i,
-        lv_char        TYPE c.
+        lv_char        TYPE c,
+        lo_ixml        TYPE REF TO if_ixml,
+        lo_stream_factory TYPE REF TO if_ixml_stream_factory,
+        lo_encoding    TYPE REF TO if_ixml_encoding,
+        lo_istream     TYPE REF TO if_ixml_istream,
+        lo_document    TYPE REF TO if_ixml_document,
+        lo_parser      TYPE REF TO if_ixml_parser,
+        lo_ostream     TYPE REF TO if_ixml_ostream,
+        lo_renderer    TYPE REF TO if_ixml_renderer.
+
+  lo_ixml = cl_ixml=>create( ).
+  lo_stream_factory = lo_ixml->create_stream_factory( ).
+  lo_encoding = lo_ixml->create_encoding( byte_order = if_ixml_encoding=>co_little_endian character_set = 'utf-8' ).
 
   LOOP AT gt_excel_raw INTO ls_excel.
-    CLEAR: gs_final, lv_hex_string, lv_clean_hex, lv_xstring, lv_xml_string.
+    CLEAR: gs_final, lv_hex_string, lv_clean_hex, lv_xstring, lv_xml_string, lv_xml_pretty.
     
     gs_final-col_a = ls_excel-col_a.
     gs_final-col_c = ls_excel-col_c.
 
-    " 1. Identify Hex Column (Assuming Col B, but checking length)
     IF strlen( ls_excel-col_b ) > 10.
       lv_hex_string = ls_excel-col_b.
     ELSEIF strlen( ls_excel-col_c ) > 10.
@@ -147,8 +159,6 @@ FORM f_process_data.
     ENDIF.
 
     IF lv_hex_string IS NOT INITIAL.
-      " 2. Clean Hex String (keep only 0-9, A-F)
-      " Manual loop to avoid Regex dependencies if any
       lv_len = strlen( lv_hex_string ).
       DO lv_len TIMES.
         lv_idx = sy-index - 1.
@@ -162,14 +172,37 @@ FORM f_process_data.
         TRY.
             lv_xstring = lv_clean_hex.
 
-            " 3. Convert using the FM you identified
+            " 1. Decode Hex
             CALL FUNCTION 'HR_RU_CONVERT_HEX_TO_STRING'
               EXPORTING
                 xstring = lv_xstring
               IMPORTING
                 cstring = lv_xml_string.
 
-            gs_final-converted = lv_xml_string.
+            " 2. Pretty Print XML (Format Indentation)
+            " Only format if it looks like XML
+            IF lv_xml_string CS '<?xml'.
+              lo_document = lo_ixml->create_document( ).
+              lo_istream  = lo_stream_factory->create_istream_string( lv_xml_string ).
+              lo_parser   = lo_ixml->create_parser( stream_factory = lo_stream_factory
+                                                    istream        = lo_istream
+                                                    document       = lo_document ).
+              
+              IF lo_parser->parse( ) = 0.
+                lo_ostream  = lo_stream_factory->create_ostream_cstring( lv_xml_pretty ).
+                lo_renderer = lo_ixml->create_renderer( ostream  = lo_ostream
+                                                        document = lo_document ).
+                lo_renderer->set_normalizing( ).
+                lo_renderer->render( ).
+                
+                gs_final-converted = lv_xml_pretty.
+              ELSE.
+                " Fallback: raw string if parsing fails
+                gs_final-converted = lv_xml_string.
+              ENDIF.
+            ELSE.
+               gs_final-converted = lv_xml_string.
+            ENDIF.
 
           CATCH cx_root.
             gs_final-error_msg = 'Conversion Failed'.
@@ -203,7 +236,6 @@ FORM f_display_alv.
       lo_cols = lo_alv->get_columns( ).
       lo_cols->set_optimize( 'X' ).
       
-      " Adjust column labels
       TRY.
           lo_col = lo_cols->get_column( 'CONVERTED' ).
           lo_col->set_long_text( 'Converted String (XML)' ).
