@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Convert Hex to String, Display in ALV
+*& Description: Upload Excel, Convert Hex using HR_RU_CONVERT_HEX_TO_STRING
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -14,12 +14,13 @@ TYPES: BEGIN OF ty_excel_raw,
          col_c TYPE string,      " Field 3
        END OF ty_excel_raw.
 
-* Output Structure
+* Output Structure - Includes all original columns + Converted Hex
 TYPES: BEGIN OF ty_final,
-         excel_id    TYPE string,
-         xml_content TYPE string,      " Converted XML Content
-         col_c       TYPE string,
-         error_msg   TYPE string,
+         col_a         TYPE string,
+         col_b         TYPE string,      " Original Hex
+         col_c         TYPE string,
+         converted_xml TYPE string,      " Deserialized String
+         error_msg     TYPE string,
        END OF ty_final.
 
 *----------------------------------------------------------------------*
@@ -129,7 +130,6 @@ FORM f_process_data.
         lv_clean_hex   TYPE string,
         lv_xstring     TYPE xstring,
         lv_xml_string  TYPE string,
-        lo_conv        TYPE REF TO cl_abap_conv_in_ce,
         lv_len         TYPE i,
         lv_idx         TYPE i,
         lv_char        TYPE c.
@@ -137,63 +137,53 @@ FORM f_process_data.
   LOOP AT gt_excel_raw INTO ls_excel.
     CLEAR: gs_final, lv_hex_string, lv_clean_hex, lv_xstring, lv_xml_string.
     
-    gs_final-excel_id = ls_excel-col_a.
-    gs_final-col_c    = ls_excel-col_c.
+    " Map all original columns
+    gs_final-col_a = ls_excel-col_a.
+    gs_final-col_b = ls_excel-col_b.
+    gs_final-col_c = ls_excel-col_c.
 
-    " 1. Identify Hex Column (Assuming it's mostly in Col B based on previous context)
-    "    Also checking Col C just in case.
+    " Identify Hex Column (Assuming Col B, but check if empty)
     IF strlen( ls_excel-col_b ) > 10.
       lv_hex_string = ls_excel-col_b.
     ELSEIF strlen( ls_excel-col_c ) > 10.
       lv_hex_string = ls_excel-col_c.
     ENDIF.
 
-    " 2. Clean Hex String manually (only 0-9, A-F)
-    lv_len = strlen( lv_hex_string ).
-    DO lv_len TIMES.
-      lv_idx = sy-index - 1.
-      lv_char = lv_hex_string+lv_idx(1).
-      IF lv_char CA '0123456789ABCDEFabcdef'.
-        CONCATENATE lv_clean_hex lv_char INTO lv_clean_hex.
-      ENDIF.
-    ENDDO.
+    IF lv_hex_string IS NOT INITIAL.
+      " Clean Hex String manually (remove newlines, spaces, etc.)
+      " This ensures HR_RU_CONVERT_HEX_TO_STRING receives valid input
+      lv_len = strlen( lv_hex_string ).
+      DO lv_len TIMES.
+        lv_idx = sy-index - 1.
+        lv_char = lv_hex_string+lv_idx(1).
+        IF lv_char CA '0123456789ABCDEFabcdef'.
+          CONCATENATE lv_clean_hex lv_char INTO lv_clean_hex.
+        ENDIF.
+      ENDDO.
 
-    IF lv_clean_hex IS INITIAL.
-      gs_final-error_msg = 'No Hex Data'.
-      APPEND gs_final TO gt_final.
-      CONTINUE.
+      IF lv_clean_hex IS NOT INITIAL.
+        TRY.
+            " Implicit conversion String -> XString
+            lv_xstring = lv_clean_hex.
+
+            " Use the requested FM
+            CALL FUNCTION 'HR_RU_CONVERT_HEX_TO_STRING'
+              EXPORTING
+                xstring = lv_xstring
+              IMPORTING
+                cstring = lv_xml_string.
+
+            gs_final-converted_xml = lv_xml_string.
+
+          CATCH cx_root.
+            gs_final-error_msg = 'Conversion Failed'.
+        ENDTRY.
+      ELSE.
+        gs_final-error_msg = 'No valid Hex chars found'.
+      ENDIF.
     ENDIF.
 
-    " 3. Convert Hex -> XString
-    TRY.
-        lv_xstring = lv_clean_hex.
-      CATCH cx_root.
-        gs_final-error_msg = 'Hex->XString Conversion Failed'.
-        APPEND gs_final TO gt_final.
-        CONTINUE.
-    ENDTRY.
-
-    " 4. Convert XString -> String (UTF-8)
-    TRY.
-        lo_conv = cl_abap_conv_in_ce=>create(
-                    encoding    = 'UTF-8'
-                    replacement = '?'
-                    ignore_cerr = 'X' ).
-
-        lo_conv->read(
-          EXPORTING data = lv_xstring
-          IMPORTING data = lv_xml_string ).
-
-        gs_final-xml_content = lv_xml_string.
-
-      CATCH cx_root.
-        gs_final-error_msg = 'UTF-8 Conversion Failed'.
-        APPEND gs_final TO gt_final.
-        CONTINUE.
-    ENDTRY.
-
     APPEND gs_final TO gt_final.
-
   ENDLOOP.
 ENDFORM.
 
@@ -219,11 +209,20 @@ FORM f_display_alv.
       
       " Adjust column labels
       TRY.
-          lo_col = lo_cols->get_column( 'XML_CONTENT' ).
-          lo_col->set_long_text( 'Converted XML Content' ).
-          lo_col->set_medium_text( 'XML Content' ).
-          lo_col->set_short_text( 'XML' ).
-          " Set to reasonable output length
+          lo_col = lo_cols->get_column( 'COL_A' ).
+          lo_col->set_short_text( 'Col A' ).
+          
+          lo_col = lo_cols->get_column( 'COL_B' ).
+          lo_col->set_short_text( 'Col B (Hex)' ).
+          lo_col->set_visible( 'X' ). 
+
+          lo_col = lo_cols->get_column( 'COL_C' ).
+          lo_col->set_short_text( 'Col C' ).
+
+          lo_col = lo_cols->get_column( 'CONVERTED_XML' ).
+          lo_col->set_long_text( 'Converted String' ).
+          lo_col->set_medium_text( 'Converted' ).
+          lo_col->set_short_text( 'Conv' ).
           lo_col->set_output_length( 100 ). 
       CATCH cx_salv_not_found.
       ENDTRY.
