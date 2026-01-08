@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Convert Hex (UTF-8), Parse Data
+*& Description: Upload Excel, Convert Hex using HR_RU_CONVERT_HEX_TO_STRING
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -135,7 +135,6 @@ FORM f_process_data.
         lv_hex_string  TYPE string,
         lv_xstring     TYPE xstring,
         lv_xml_string  TYPE string,
-        lo_conv        TYPE REF TO cl_abap_conv_in_ce,
         lv_sub_off     TYPE i,
         lv_match_off   TYPE i,
         lv_match_len   TYPE i,
@@ -185,22 +184,12 @@ FORM f_process_data.
         CONTINUE. 
     ENDTRY.
 
-    " 3. Convert XString to String (UTF-8)
-    " Standard ABAP class for Codepage conversion
-    TRY.
-        lo_conv = cl_abap_conv_in_ce=>create( 
-                    input       = lv_xstring 
-                    encoding    = 'UTF-8' 
-                    replacement = '?' 
-                    ignore_cerr = 'X' ).
-        
-        lo_conv->read( IMPORTING data = lv_xml_string ).
-
-      CATCH cx_root.
-        gs_final-error_msg = 'UTF-8 Decoding Failed'.
-        APPEND gs_final TO gt_final.
-        CONTINUE.
-    ENDTRY.
+    " 3. Convert using HR_RU_CONVERT_HEX_TO_STRING
+    CALL FUNCTION 'HR_RU_CONVERT_HEX_TO_STRING'
+      EXPORTING
+        xstring = lv_xstring
+      IMPORTING
+        cstring = lv_xml_string.
 
     gs_final-xml_len = strlen( lv_xml_string ).
 
