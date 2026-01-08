@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Convert Hex using HR_RU_CONVERT_HEX_TO_STRING
+*& Description: Upload Excel, Hex->XString->String (SCMS), Parse Data
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -25,7 +25,8 @@ TYPES: BEGIN OF ty_final,
          decision_l2 TYPE string,
          score_r     TYPE string,
          score_g     TYPE string,
-         xml_len     TYPE i,           " Debug: Length of decoded XML
+         debug_hex   TYPE string,      " Debug: First 20 chars of Hex
+         debug_xml   TYPE string,      " Debug: First 50 chars of XML
          error_msg   TYPE string,
        END OF ty_final.
 
@@ -137,7 +138,6 @@ FORM f_process_data.
         lv_xml_string  TYPE string,
         lv_sub_off     TYPE i,
         lv_match_off   TYPE i,
-        lv_match_len   TYPE i,
         lv_end_off     TYPE i,
         lv_str_start   TYPE i,
         lv_str_len     TYPE i,
@@ -152,19 +152,22 @@ FORM f_process_data.
         lv_id_end      TYPE i,
         lv_id_len      TYPE i,
         lv_last_id_start TYPE i,
-        lv_last_id_end   TYPE i.
+        lv_last_id_end   TYPE i,
+        lv_mimetype    TYPE string.
 
   LOOP AT gt_excel_raw INTO ls_excel.
     CLEAR: gs_final, lv_hex_string, lv_xstring, lv_xml_string, lv_found_items.
     gs_final-excel_id = ls_excel-col_a.
 
     " 1. Identify and Clean Hex Column
-    " Use basic heuristic: Longest column likely contains the XML Hex
+    " Heuristic: Longest column likely contains the XML Hex
     IF strlen( ls_excel-col_b ) > strlen( ls_excel-col_c ) AND strlen( ls_excel-col_b ) > 10.
       lv_hex_string = ls_excel-col_b.
     ELSEIF strlen( ls_excel-col_c ) > 10.
       lv_hex_string = ls_excel-col_c.
     ENDIF.
+    
+    gs_final-debug_hex = substring( val = lv_hex_string len = 20 ).
 
     " Remove all non-hex characters (newlines, spaces, etc)
     REPLACE ALL OCCURRENCES OF REGEX '[^0-9A-Fa-f]' IN lv_hex_string WITH ''.
@@ -184,14 +187,35 @@ FORM f_process_data.
         CONTINUE. 
     ENDTRY.
 
-    " 3. Convert using HR_RU_CONVERT_HEX_TO_STRING
-    CALL FUNCTION 'HR_RU_CONVERT_HEX_TO_STRING'
+    " 3. Convert XString to String using SCMS Function
+    " This is highly robust and handles various encodings if needed
+    CALL FUNCTION 'SCMS_XSTRING_TO_STRING'
       EXPORTING
-        xstring = lv_xstring
+        buffer        = lv_xstring
+        encoding      = '4110' " UTF-8
       IMPORTING
-        cstring = lv_xml_string.
+        output_string = lv_xml_string
+      EXCEPTIONS
+        failed        = 1
+        OTHERS        = 2.
 
-    gs_final-xml_len = strlen( lv_xml_string ).
+    IF sy-subrc <> 0.
+      " Fallback: Try with '1100' (ISO-8859-1) or no encoding
+      CALL FUNCTION 'SCMS_XSTRING_TO_STRING'
+        EXPORTING
+          buffer        = lv_xstring
+        IMPORTING
+          output_string = lv_xml_string
+        EXCEPTIONS
+          OTHERS        = 1.
+    ENDIF.
+
+    " Populate debug info
+    IF strlen( lv_xml_string ) > 50.
+      gs_final-debug_xml = substring( val = lv_xml_string len = 50 ).
+    ELSE.
+      gs_final-debug_xml = lv_xml_string.
+    ENDIF.
 
     " 4. Parse XML - Search for <STR> tags
     lv_sub_off = 0.
@@ -203,10 +227,10 @@ FORM f_process_data.
            IGNORING CASE.
       
       IF sy-subrc <> 0.
-        EXIT. " No more STR tags
+        EXIT. 
       ENDIF.
       
-      lv_str_start = lv_match_off + 5. " <STR> is 5 chars
+      lv_str_start = lv_match_off + 5. 
 
       " Search for closing </STR> case-insensitive
       FIND FIRST OCCURRENCE OF '</STR>' IN SECTION OFFSET lv_str_start OF lv_xml_string 
@@ -214,7 +238,7 @@ FORM f_process_data.
            IGNORING CASE.
       
       IF sy-subrc <> 0.
-        EXIT. " Malformed XML (no closing tag)
+        EXIT. 
       ENDIF.
 
       lv_str_len = lv_end_off - lv_str_start.
@@ -228,12 +252,10 @@ FORM f_process_data.
              gs_final-decision_l2, gs_final-score_r, gs_final-score_g.
       
       " Find preceding ID
-      " Search for <ID>...<ID> strictly before the current <STR>
       CLEAR: lv_last_id_start, lv_last_id_end.
       lv_temp_off = 0.
       
       WHILE 1 = 1.
-        " Limit search scope to current STR position
         DATA: lv_scope_len TYPE i.
         lv_scope_len = lv_match_off - lv_temp_off.
         
@@ -285,7 +307,6 @@ FORM f_process_data.
 
       APPEND gs_final TO gt_final.
       
-      " Advance offset past current </STR>
       lv_sub_off = lv_end_off + 6. 
     ENDWHILE.
 
@@ -303,7 +324,8 @@ ENDFORM.
 FORM f_display_alv.
   DATA: lo_alv TYPE REF TO cl_salv_table,
         lo_msg TYPE REF TO cx_salv_msg,
-        lo_cols TYPE REF TO cl_salv_columns_table.
+        lo_cols TYPE REF TO cl_salv_columns_table,
+        lo_col  TYPE REF TO cl_salv_column.
 
   TRY.
       cl_salv_table=>factory(
@@ -315,6 +337,15 @@ FORM f_display_alv.
 
       lo_cols = lo_alv->get_columns( ).
       lo_cols->set_optimize( 'X' ).
+
+      " Rename columns for better readability
+      TRY.
+          lo_col = lo_cols->get_column( 'DEBUG_HEX' ).
+          lo_col->set_long_text( 'Hex Preview' ).
+          lo_col = lo_cols->get_column( 'DEBUG_XML' ).
+          lo_col->set_long_text( 'XML Preview' ).
+      CATCH cx_salv_not_found.
+      ENDTRY.
 
       lo_alv->display( ).
 
