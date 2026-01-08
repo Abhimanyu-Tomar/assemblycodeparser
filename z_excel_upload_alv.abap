@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*&
+*& Description: Upload Excel, Parse Pipe-Delimited String, Display ALV
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -9,25 +9,23 @@ REPORT z_excel_upload_alv.
 * Types Declaration
 *----------------------------------------------------------------------*
 TYPES: BEGIN OF ty_excel_raw,
-         col_a TYPE string,
-         col_b TYPE string, " Serialized data
-         col_c TYPE string,
+         col_a TYPE string,      " Field 1 (ID)
+         col_b TYPE string,      " Field 2 (Possibly Empty in some views)
+         col_c TYPE string,      " Field 3 (Complex String)
        END OF ty_excel_raw.
 
-* Structure for Deserialized Data (Column B)
-* Update this structure based on the actual JSON content
-TYPES: BEGIN OF ty_json_data,
-         key   TYPE string,
-         value TYPE string,
-         desc  TYPE string,
-       END OF ty_json_data.
-
+* Final Output Structure for ALV
 TYPES: BEGIN OF ty_final,
-         id          TYPE string,
-         json_key    TYPE string,
-         json_value  TYPE string,
-         json_desc   TYPE string,
-         description TYPE string,
+         id          TYPE string,      " From Col A
+         " Parsed fields from string
+         segment_1   TYPE string,
+         segment_2   TYPE string,
+         segment_3   TYPE string,
+         segment_4   TYPE string,
+         segment_5   TYPE string,
+         suffix      TYPE string,
+         " Raw data for reference
+         raw_string  TYPE string,
        END OF ty_final.
 
 *----------------------------------------------------------------------*
@@ -44,6 +42,12 @@ DATA: gt_excel_raw TYPE TABLE OF ty_excel_raw,
 SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
   PARAMETERS: p_file TYPE localfile OBLIGATORY.
 SELECTION-SCREEN END OF BLOCK b1.
+
+*----------------------------------------------------------------------*
+* Initialization
+*----------------------------------------------------------------------*
+INITIALIZATION.
+  TEXT-001 = 'File Selection'.
 
 *----------------------------------------------------------------------*
 * At Selection Screen
@@ -71,7 +75,7 @@ FORM f_file_open.
     EXPORTING
       window_title            = 'Select Excel File'
       default_extension       = 'xlsx'
-      file_filter             = 'Excel Files (*.xlsx)|*.xlsx|All Files (*.*)|*.*'
+      file_filter             = 'Excel Files (*.xlsx;*.xls)|*.xlsx;*.xls|All Files (*.*)|*.*'
     CHANGING
       file_table              = lt_file_table
       rc                      = lv_rc
@@ -101,13 +105,9 @@ FORM f_upload_excel.
 
   lv_filename = p_file.
 
-  " Note: simpler TEXT_CONVERT_XLS_TO_SAP is used here for demonstration.
-  " Ensure the function module exists in your system.
-  " Alternatively, use CL_FDT_XL_SPREADSHEET for strictly XLSX handling without FMs.
-  
   CALL FUNCTION 'TEXT_CONVERT_XLS_TO_SAP'
     EXPORTING
-      i_line_header        = 'X' " Assume header line exists
+      i_line_header        = 'X'
       i_tab_raw_data       = lt_raw_data
       i_filename           = lv_filename
     TABLES
@@ -125,35 +125,53 @@ ENDFORM.
 *& Form f_process_data
 *&---------------------------------------------------------------------*
 FORM f_process_data.
-  DATA: ls_excel LIKE LINE OF gt_excel_raw,
-        ls_json  TYPE ty_json_data.
+  DATA: ls_excel    LIKE LINE OF gt_excel_raw,
+        lv_raw      TYPE string,
+        lt_segments TYPE TABLE OF string,
+        lv_count    TYPE i.
 
   LOOP AT gt_excel_raw INTO ls_excel.
-    CLEAR: gs_final, ls_json.
+    CLEAR: gs_final, lv_raw, lt_segments.
 
-    " Map direct columns
-    gs_final-id          = ls_excel-col_a.
-    gs_final-description = ls_excel-col_c.
+    gs_final-id = ls_excel-col_a.
 
-    " Deserialize Column B (assuming JSON format)
-    " Remove potential outer quotes if present from Excel
-    REPLACE ALL OCCURRENCES OF '"' IN ls_excel-col_b WITH ''. 
-    " The above REPLACE is risky if JSON has quotes. 
-    " Only do this if Excel wraps the whole cell in quotes unnecessarily.
-    " Usually, /ui2/cl_json handles standard JSON strings well.
-    
-    " Assuming Column B is valid JSON string e.g. {"key":"123", "value":"Test", "desc":"Detail"}
-    /ui2/cl_json=>deserialize(
-      EXPORTING
-        json = ls_excel-col_b
-      CHANGING
-        data = ls_json
-    ).
+    " Determine which column holds the complex string
+    " Based on the user screenshot, it might be in Col C if Col B is empty
+    IF ls_excel-col_b IS NOT INITIAL AND ls_excel-col_b CA '|;'.
+      lv_raw = ls_excel-col_b.
+    ELSEIF ls_excel-col_c IS NOT INITIAL.
+      lv_raw = ls_excel-col_c.
+    ELSE.
+      " Fallback: use Col B if Col C is empty, even if Col B doesn't look complex
+      lv_raw = ls_excel-col_b.
+    ENDIF.
 
-    " Map deserialized data to final structure
-    gs_final-json_key   = ls_json-key.
-    gs_final-json_value = ls_json-value.
-    gs_final-json_desc  = ls_json-desc.
+    gs_final-raw_string = lv_raw.
+
+    " Logic to parse the string: Split by Pipe (|)
+    IF lv_raw IS NOT INITIAL.
+      SPLIT lv_raw AT '|' INTO TABLE lt_segments.
+      
+      " Map segments to fields
+      DESCRIBE TABLE lt_segments LINES lv_count.
+      
+      LOOP AT lt_segments INTO DATA(lv_segment).
+        CASE sy-tabix.
+          WHEN 1. gs_final-segment_1 = lv_segment.
+          WHEN 2. gs_final-segment_2 = lv_segment.
+          WHEN 3. gs_final-segment_3 = lv_segment.
+          WHEN 4. gs_final-segment_4 = lv_segment.
+          WHEN 5. gs_final-segment_5 = lv_segment.
+          " The last segment often contains the suffix (Company Name etc)
+          " If there are many segments, the last one might be special
+        ENDCASE.
+      ENDLOOP.
+      
+      " Optional: If the string has NO pipes, put it all in Segment 1
+      IF lv_count = 0.
+         gs_final-segment_1 = lv_raw.
+      ENDIF.
+    ENDIF.
 
     APPEND gs_final TO gt_final.
   ENDLOOP.
@@ -164,7 +182,9 @@ ENDFORM.
 *&---------------------------------------------------------------------*
 FORM f_display_alv.
   DATA: lo_alv TYPE REF TO cl_salv_table,
-        lo_msg TYPE REF TO cx_salv_msg.
+        lo_msg TYPE REF TO cx_salv_msg,
+        lo_cols TYPE REF TO cl_salv_columns_table,
+        lo_col  TYPE REF TO cl_salv_column.
 
   TRY.
       cl_salv_table=>factory(
@@ -174,10 +194,24 @@ FORM f_display_alv.
           t_table      = gt_final
       ).
 
-      " Optional: Optimize column width
-      lo_alv->get_columns( )->set_optimize( 'X' ).
+      lo_cols = lo_alv->get_columns( ).
+      lo_cols->set_optimize( 'X' ).
 
-      " Display ALV
+      " Rename columns for better readability
+      TRY.
+          lo_col = lo_cols->get_column( 'SEGMENT_1' ).
+          lo_col->set_long_text( 'Data Segment 1' ).
+          lo_col->set_medium_text( 'Segment 1' ).
+          lo_col->set_short_text( 'Seg 1' ).
+
+          lo_col = lo_cols->get_column( 'SEGMENT_2' ).
+          lo_col->set_long_text( 'Data Segment 2' ).
+
+          lo_col = lo_cols->get_column( 'RAW_STRING' ).
+          lo_col->set_long_text( 'Original String' ).
+        CATCH cx_salv_not_found.
+      ENDTRY.
+
       lo_alv->display( ).
 
     CATCH cx_salv_msg INTO lo_msg.
