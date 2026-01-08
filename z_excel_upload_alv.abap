@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Decode Base64, Display ALV
+*& Description: Upload Excel, Convert Hex using HR_RU_CONVERT_HEX_TO_STRING
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -10,14 +10,14 @@ REPORT z_excel_upload_alv.
 *----------------------------------------------------------------------*
 TYPES: BEGIN OF ty_excel_raw,
          col_a TYPE string,      " Field 1
-         col_b TYPE string,      " Field 2 (Encoded String)
+         col_b TYPE string,      " Field 2 (Hex String)
          col_c TYPE string,      " Field 3
        END OF ty_excel_raw.
 
 * Output Structure
 TYPES: BEGIN OF ty_final,
          col_a     TYPE string,
-         col_b     TYPE string,      " Decoded String (XML)
+         converted TYPE string,      " Readable String
          col_c     TYPE string,
          error_msg TYPE string,
        END OF ty_final.
@@ -125,40 +125,58 @@ ENDFORM.
 *&---------------------------------------------------------------------*
 FORM f_process_data.
   DATA: ls_excel       LIKE LINE OF gt_excel_raw,
-        lv_input_str   TYPE string,
-        lv_decoded_str TYPE string.
+        lv_hex_string  TYPE string,
+        lv_clean_hex   TYPE string,
+        lv_xstring     TYPE xstring,
+        lv_xml_string  TYPE string,
+        lv_len         TYPE i,
+        lv_idx         TYPE i,
+        lv_char        TYPE c.
 
   LOOP AT gt_excel_raw INTO ls_excel.
-    CLEAR: gs_final, lv_input_str, lv_decoded_str.
+    CLEAR: gs_final, lv_hex_string, lv_clean_hex, lv_xstring, lv_xml_string.
     
     gs_final-col_a = ls_excel-col_a.
     gs_final-col_c = ls_excel-col_c.
 
-    " Determine which column has the encoded data
+    " 1. Identify Hex Column (Assuming Col B, but checking length)
     IF strlen( ls_excel-col_b ) > 10.
-      lv_input_str = ls_excel-col_b.
+      lv_hex_string = ls_excel-col_b.
     ELSEIF strlen( ls_excel-col_c ) > 10.
-      lv_input_str = ls_excel-col_c.
+      lv_hex_string = ls_excel-col_c.
     ENDIF.
 
-    IF lv_input_str IS NOT INITIAL.
-      " Clean input (remove newlines/spaces) just in case
-      " CONDENSE lv_input_str NO-GAPS. " Caution: Might break Base64 padding if present?
-      " Base64 relies on correct length, but whitespace is usually ignored by decoders.
-      " Let's remove typical whitespace:
-      REPLACE ALL OCCURRENCES OF REGEX '\s' IN lv_input_str WITH ''.
+    IF lv_hex_string IS NOT INITIAL.
+      " 2. Clean Hex String (keep only 0-9, A-F)
+      " Manual loop to avoid Regex dependencies if any
+      lv_len = strlen( lv_hex_string ).
+      DO lv_len TIMES.
+        lv_idx = sy-index - 1.
+        lv_char = lv_hex_string+lv_idx(1).
+        IF lv_char CA '0123456789ABCDEFabcdef'.
+          CONCATENATE lv_clean_hex lv_char INTO lv_clean_hex.
+        ENDIF.
+      ENDDO.
 
-      TRY.
-          " Use cl_http_utility=>decode_base64 as requested
-          lv_decoded_str = cl_http_utility=>decode_base64( encoded = lv_input_str ).
-          
-          gs_final-col_b = lv_decoded_str.
+      IF lv_clean_hex IS NOT INITIAL.
+        TRY.
+            lv_xstring = lv_clean_hex.
 
-        CATCH cx_root.
-          gs_final-error_msg = 'Base64 Decode Failed'.
-      ENDTRY.
-    ELSE.
-      gs_final-error_msg = 'No input data to decode'.
+            " 3. Convert using the FM you identified
+            CALL FUNCTION 'HR_RU_CONVERT_HEX_TO_STRING'
+              EXPORTING
+                xstring = lv_xstring
+              IMPORTING
+                cstring = lv_xml_string.
+
+            gs_final-converted = lv_xml_string.
+
+          CATCH cx_root.
+            gs_final-error_msg = 'Conversion Failed'.
+        ENDTRY.
+      ELSE.
+        gs_final-error_msg = 'No valid hex chars'.
+      ENDIF.
     ENDIF.
 
     APPEND gs_final TO gt_final.
@@ -187,10 +205,9 @@ FORM f_display_alv.
       
       " Adjust column labels
       TRY.
-          lo_col = lo_cols->get_column( 'COL_B' ).
-          lo_col->set_long_text( 'Decoded Content' ).
-          lo_col->set_medium_text( 'Decoded' ).
-          lo_col->set_short_text( 'XML' ).
+          lo_col = lo_cols->get_column( 'CONVERTED' ).
+          lo_col->set_long_text( 'Converted String (XML)' ).
+          lo_col->set_medium_text( 'Converted' ).
           lo_col->set_output_length( 100 ). 
       CATCH cx_salv_not_found.
       ENDTRY.
