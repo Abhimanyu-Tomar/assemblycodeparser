@@ -1,12 +1,12 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Robust Parsing with Debug Info
+*& Description: Upload Excel, Convert Hex using HR_RU_CONVERT_HEX_TO_STRING
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
 *----------------------------------------------------------------------*
-* Types Declaration
+* Type Definitions
 *----------------------------------------------------------------------*
 TYPES: BEGIN OF ty_excel_raw,
          col_a TYPE string,      " Field 1
@@ -14,10 +14,10 @@ TYPES: BEGIN OF ty_excel_raw,
          col_c TYPE string,      " Field 3
        END OF ty_excel_raw.
 
-* Final Output Structure for ALV
+* Output Structure
 TYPES: BEGIN OF ty_final,
-         excel_id    TYPE string,      " From Col A
-         xml_item_id TYPE string,      " From XML <ID>
+         excel_id    TYPE string,
+         xml_item_id TYPE string,
          ewoid       TYPE string,
          status      TYPE string,
          level       TYPE string,
@@ -25,18 +25,17 @@ TYPES: BEGIN OF ty_final,
          decision_l2 TYPE string,
          score_r     TYPE string,
          score_g     TYPE string,
-         hex_len     TYPE i,           " Debug: Length of hex string
-         debug_info  TYPE string,      " Debug: First 50 chars of decoded string
-         error_msg   TYPE string,      " Error details
+         raw_str     TYPE string,      " Decoded XML String (content)
+         error_msg   TYPE string,
        END OF ty_final.
 
 *----------------------------------------------------------------------*
-* Data Declaration
+* Data Declarations
 *----------------------------------------------------------------------*
 DATA: gt_excel_raw TYPE TABLE OF ty_excel_raw,
       gt_final     TYPE TABLE OF ty_final,
       gs_final     TYPE ty_final,
-      gv_file      TYPE string.
+      gv_file      TYPE rlgrap-filename.
 
 *----------------------------------------------------------------------*
 * Selection Screen
@@ -62,7 +61,7 @@ AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
 *----------------------------------------------------------------------*
 START-OF-SELECTION.
   PERFORM f_upload_excel.
-  
+
   IF gt_excel_raw IS INITIAL.
     MESSAGE 'No data found in Excel file.' TYPE 'S' DISPLAY LIKE 'E'.
   ELSE.
@@ -132,76 +131,62 @@ ENDFORM.
 *& Form f_process_data
 *&---------------------------------------------------------------------*
 FORM f_process_data.
-  DATA: ls_excel      LIKE LINE OF gt_excel_raw,
-        lv_hex_string TYPE string,
-        lv_xstring    TYPE xstring,
-        lo_conv       TYPE REF TO cl_abap_conv_in_ce,
-        lv_full_xml_str TYPE string,
-        lv_str_content TYPE string,
-        lt_parts      TYPE TABLE OF string,
-        lv_part       TYPE string,
-        lv_key        TYPE string,
-        lv_value      TYPE string,
+  DATA: ls_excel       LIKE LINE OF gt_excel_raw,
+        lv_hex_string  TYPE string,
+        lv_xstring     TYPE xstring,
+        lv_xml_string  TYPE string,
+        lv_sub_off     TYPE i,
+        lv_match_off   TYPE i,
+        lv_match_len   TYPE i,
         lv_found_items TYPE abap_bool,
-        lv_match_off  TYPE i,
-        lv_match_len  TYPE i,
-        lv_sub_off    TYPE i,
-        lv_sub_len    TYPE i.
+        lv_str_content TYPE string,
+        lt_parts       TYPE TABLE OF string,
+        lv_part        TYPE string,
+        lv_key         TYPE string,
+        lv_value       TYPE string.
 
   LOOP AT gt_excel_raw INTO ls_excel.
-    CLEAR: lv_hex_string, gs_final, lv_found_items, lv_xstring, lv_full_xml_str.
+    CLEAR: gs_final, lv_hex_string, lv_xstring, lv_xml_string, lv_found_items.
     gs_final-excel_id = ls_excel-col_a.
-    
-    " Clean and Determine Hex Column
-    CONDENSE ls_excel-col_b NO-GAPS.
-    CONDENSE ls_excel-col_c NO-GAPS.
 
+    " Determine Hex Column & Clean
+    " Based on User Logic: Keep only Valid Hex Chars [0-9A-Fa-f]
     IF ls_excel-col_b IS NOT INITIAL AND strlen( ls_excel-col_b ) > 10.
       lv_hex_string = ls_excel-col_b.
     ELSEIF ls_excel-col_c IS NOT INITIAL AND strlen( ls_excel-col_c ) > 10.
       lv_hex_string = ls_excel-col_c.
     ENDIF.
 
-    gs_final-hex_len = strlen( lv_hex_string ).
+    REPLACE ALL OCCURRENCES OF REGEX '[^0-9A-Fa-f]' IN lv_hex_string WITH ''.
 
     IF lv_hex_string IS INITIAL.
-      gs_final-error_msg = 'No Hex Data'.
+      gs_final-error_msg = 'No Valid Hex Data'.
       APPEND gs_final TO gt_final.
       CONTINUE.
     ENDIF.
 
-    " 1. Convert Hex String to XString
+    " Convert Hex using HR Function Module as requested
     TRY.
         lv_xstring = lv_hex_string.
-      CATCH cx_root.
-        gs_final-error_msg = 'Hex Convert Fail'.
-        APPEND gs_final TO gt_final.
-        CONTINUE. 
-    ENDTRY.
 
-    " 2. Convert to String (Try UTF-8 first)
-    TRY.
-        lo_conv = cl_abap_conv_in_ce=>create( input = lv_xstring encoding = 'UTF-8' replacement = '?' ignore_cerr = 'X' ).
-        lo_conv->read( IMPORTING data = lv_full_xml_str ).
+        CALL FUNCTION 'HR_RU_CONVERT_HEX_TO_STRING'
+          EXPORTING
+            xstring = lv_xstring
+          IMPORTING
+            cstring = lv_xml_string.
+
       CATCH cx_root.
-        gs_final-error_msg = 'UTF-8 Fail'.
+        gs_final-error_msg = 'Hex Conversion Failed'.
         APPEND gs_final TO gt_final.
         CONTINUE.
     ENDTRY.
 
-    " Populate Debug Info
-    IF strlen( lv_full_xml_str ) > 50.
-      gs_final-debug_info = substring( val = lv_full_xml_str len = 50 ).
-    ELSE.
-      gs_final-debug_info = lv_full_xml_str.
-    ENDIF.
-
-    " 3. Robust Search for <STR>...</STR>
-    " We loop searching for <STR> to handle multiple occurrences
+    " Parse the Decoded String (XML-like)
+    " Robust Search for <STR>...</STR> blocks
     lv_sub_off = 0.
     WHILE 1 = 1.
-      FIND REGEX '<STR>(.*?)</STR>' IN SECTION OFFSET lv_sub_off OF lv_full_xml_str 
-           MATCH OFFSET lv_match_off 
+      FIND REGEX '<STR>(.*?)</STR>' IN SECTION OFFSET lv_sub_off OF lv_xml_string
+           MATCH OFFSET lv_match_off
            MATCH LENGTH lv_match_len
            IGNORING CASE.
       
@@ -211,29 +196,37 @@ FORM f_process_data.
 
       lv_found_items = abap_true.
       
-      " Extract Content (remove tags)
-      " Length of <STR> is 5, </STR> is 6. Total 11 chars overhead.
-      " Content starts at MatchOffset + 5
-      lv_str_content = substring( val = lv_full_xml_str off = lv_match_off + 5 len = lv_match_len - 11 ).
-      
-      " Reset fields
-      CLEAR: gs_final-ewoid, gs_final-status, gs_final-shorttext,
-             gs_final-decision_l2, gs_final-score_r, gs_final-score_g.
-      
-      " Attempt to find ID just before this STR (Optional, but good for completeness)
-      " Simple lookback or just skipping it for now to ensure STR works first.
+      " Extract Content: MatchOffset + 5 (len of <STR>), Length = MatchLen - 11 (len of <STR></STR>)
+      lv_str_content = substring( val = lv_xml_string off = lv_match_off + 5 len = lv_match_len - 11 ).
+      gs_final-raw_str = lv_str_content. " Save for reference
 
-      " 4. Parse STR content
+      " Reset fields for new item
+      CLEAR: gs_final-ewoid, gs_final-status, gs_final-shorttext, gs_final-xml_item_id,
+             gs_final-decision_l2, gs_final-score_r, gs_final-score_g.
+
+      " Attempt to find ID for this block (Look backwards from STR pos)
+      " Simple heuristic: Find last <ID> before this <STR>
+      DATA: lv_id_match_off TYPE i, lv_id_match_len TYPE i.
+      FIND REGEX '<ID>(.*?)</ID>' IN SECTION OFFSET 0 LENGTH lv_match_off OF lv_xml_string
+           MATCH OFFSET lv_id_match_off
+           MATCH LENGTH lv_id_match_len
+           IGNORING CASE.
+      IF sy-subrc = 0.
+         " If multiple IDs exist, this finds the *first* one in the block. 
+         " For strict XML matching, we'd need loop logic, but this often suffices for sequential data.
+         " Better approach: Search in the small chunk between previous STR end and current STR start.
+         gs_final-xml_item_id = substring( val = lv_xml_string off = lv_id_match_off + 4 len = lv_id_match_len - 9 ).
+      ENDIF.
+
+      " Parse Key==Value||...
       REPLACE ALL OCCURRENCES OF '&lt;' IN lv_str_content WITH '<'.
       REPLACE ALL OCCURRENCES OF '&gt;' IN lv_str_content WITH '>'.
       REPLACE ALL OCCURRENCES OF '&amp;' IN lv_str_content WITH '&'.
 
       SPLIT lv_str_content AT '||' INTO TABLE lt_parts.
-      
       LOOP AT lt_parts INTO lv_part.
         SPLIT lv_part AT '==' INTO lv_key lv_value.
         CONDENSE lv_key.
-        
         CASE lv_key.
           WHEN 'EWOID'.       gs_final-ewoid       = lv_value.
           WHEN 'STATUS'.      gs_final-status      = lv_value.
@@ -242,19 +235,16 @@ FORM f_process_data.
           WHEN 'DECISION_L2'. gs_final-decision_l2 = lv_value.
           WHEN 'L2_SCORE_R'.  gs_final-score_r     = lv_value.
           WHEN 'L2_SCORE_G'.  gs_final-score_g     = lv_value.
-          WHEN 'SCORE_YES_R'. IF gs_final-score_r IS INITIAL. gs_final-score_r = lv_value. ENDIF.
-          WHEN 'SCORE_YES_G'. IF gs_final-score_g IS INITIAL. gs_final-score_g = lv_value. ENDIF.
         ENDCASE.
       ENDLOOP.
 
       APPEND gs_final TO gt_final.
-      
-      " Advance offset
       lv_sub_off = lv_match_off + lv_match_len.
     ENDWHILE.
-    
+
     IF lv_found_items = abap_false.
-        gs_final-error_msg = 'No <STR> tags found'.
+        gs_final-error_msg = 'No <STR> tags found in decoded content'.
+        gs_final-raw_str = lv_xml_string(100). " Show first 100 chars
         APPEND gs_final TO gt_final.
     ENDIF.
 
@@ -267,8 +257,7 @@ ENDFORM.
 FORM f_display_alv.
   DATA: lo_alv TYPE REF TO cl_salv_table,
         lo_msg TYPE REF TO cx_salv_msg,
-        lo_cols TYPE REF TO cl_salv_columns_table,
-        lo_col  TYPE REF TO cl_salv_column.
+        lo_cols TYPE REF TO cl_salv_columns_table.
 
   TRY.
       cl_salv_table=>factory(
