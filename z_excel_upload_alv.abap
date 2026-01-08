@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Decode Hex XML, Parse Data (Robust), Display ALV
+*& Description: Upload Excel, Robust Parsing with Debug Info
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -25,7 +25,9 @@ TYPES: BEGIN OF ty_final,
          decision_l2 TYPE string,
          score_r     TYPE string,
          score_g     TYPE string,
-         error_msg   TYPE string,      " Debugging info
+         hex_len     TYPE i,           " Debug: Length of hex string
+         debug_info  TYPE string,      " Debug: First 50 chars of decoded string
+         error_msg   TYPE string,      " Error details
        END OF ty_final.
 
 *----------------------------------------------------------------------*
@@ -65,11 +67,7 @@ START-OF-SELECTION.
     MESSAGE 'No data found in Excel file.' TYPE 'S' DISPLAY LIKE 'E'.
   ELSE.
     PERFORM f_process_data.
-    IF gt_final IS INITIAL.
-      MESSAGE 'Excel uploaded but no valid data extracted.' TYPE 'S' DISPLAY LIKE 'E'.
-    ELSE.
-      PERFORM f_display_alv.
-    ENDIF.
+    PERFORM f_display_alv.
   ENDIF.
 
 *&---------------------------------------------------------------------*
@@ -139,18 +137,16 @@ FORM f_process_data.
         lv_xstring    TYPE xstring,
         lo_conv       TYPE REF TO cl_abap_conv_in_ce,
         lv_full_xml_str TYPE string,
-        lt_xml_parts  TYPE TABLE OF string,
-        lv_xml_part   TYPE string,
-        lv_item_id    TYPE string,
         lv_str_content TYPE string,
         lt_parts      TYPE TABLE OF string,
         lv_part       TYPE string,
         lv_key        TYPE string,
         lv_value      TYPE string,
         lv_found_items TYPE abap_bool,
-        lv_off_start  TYPE i,
-        lv_off_end    TYPE i,
-        lv_len        TYPE i.
+        lv_match_off  TYPE i,
+        lv_match_len  TYPE i,
+        lv_sub_off    TYPE i,
+        lv_sub_len    TYPE i.
 
   LOOP AT gt_excel_raw INTO ls_excel.
     CLEAR: lv_hex_string, gs_final, lv_found_items, lv_xstring, lv_full_xml_str.
@@ -166,106 +162,99 @@ FORM f_process_data.
       lv_hex_string = ls_excel-col_c.
     ENDIF.
 
+    gs_final-hex_len = strlen( lv_hex_string ).
+
     IF lv_hex_string IS INITIAL.
-      gs_final-error_msg = 'No Hex Data Found'.
+      gs_final-error_msg = 'No Hex Data'.
       APPEND gs_final TO gt_final.
       CONTINUE.
     ENDIF.
 
-    " 1. Convert Hex String to XString (Binary)
+    " 1. Convert Hex String to XString
     TRY.
         lv_xstring = lv_hex_string.
       CATCH cx_root.
-        gs_final-error_msg = 'Hex Conversion Failed'.
+        gs_final-error_msg = 'Hex Convert Fail'.
         APPEND gs_final TO gt_final.
         CONTINUE. 
     ENDTRY.
 
-    " 2. Convert XString to String (UTF-8) - Ignoring Errors
-    " We use manual string parsing instead of strict XML parser to avoid 'Invalid XML Structure' errors.
+    " 2. Convert to String (Try UTF-8 first)
     TRY.
         lo_conv = cl_abap_conv_in_ce=>create( input = lv_xstring encoding = 'UTF-8' replacement = '?' ignore_cerr = 'X' ).
         lo_conv->read( IMPORTING data = lv_full_xml_str ).
       CATCH cx_root.
-        gs_final-error_msg = 'UTF-8 Conversion Failed'.
+        gs_final-error_msg = 'UTF-8 Fail'.
         APPEND gs_final TO gt_final.
         CONTINUE.
     ENDTRY.
 
-    " 3. Manual Extraction using SPLIT (Robust against XML structure issues)
-    " We assume the structure contains <item> ... </item> blocks
-    SPLIT lv_full_xml_str AT '<item>' INTO TABLE lt_xml_parts.
+    " Populate Debug Info
+    IF strlen( lv_full_xml_str ) > 50.
+      gs_final-debug_info = substring( val = lv_full_xml_str len = 50 ).
+    ELSE.
+      gs_final-debug_info = lv_full_xml_str.
+    ENDIF.
 
-    LOOP AT lt_xml_parts INTO lv_xml_part.
-      IF sy-tabix = 1. CONTINUE. ENDIF. " Skip content before first <item>
+    " 3. Robust Search for <STR>...</STR>
+    " We loop searching for <STR> to handle multiple occurrences
+    lv_sub_off = 0.
+    WHILE 1 = 1.
+      FIND REGEX '<STR>(.*?)</STR>' IN SECTION OFFSET lv_sub_off OF lv_full_xml_str 
+           MATCH OFFSET lv_match_off 
+           MATCH LENGTH lv_match_len
+           IGNORING CASE.
       
-      CLEAR: gs_final-xml_item_id, 
-             gs_final-ewoid, gs_final-status, gs_final-shorttext,
-             gs_final-decision_l2, gs_final-score_r, gs_final-score_g.
-      gs_final-excel_id = ls_excel-col_a.
+      IF sy-subrc <> 0.
+        EXIT. 
+      ENDIF.
+
       lv_found_items = abap_true.
+      
+      " Extract Content (remove tags)
+      " Length of <STR> is 5, </STR> is 6. Total 11 chars overhead.
+      " Content starts at MatchOffset + 5
+      lv_str_content = substring( val = lv_full_xml_str off = lv_match_off + 5 len = lv_match_len - 11 ).
+      
+      " Reset fields
+      CLEAR: gs_final-ewoid, gs_final-status, gs_final-shorttext,
+             gs_final-decision_l2, gs_final-score_r, gs_final-score_g.
+      
+      " Attempt to find ID just before this STR (Optional, but good for completeness)
+      " Simple lookback or just skipping it for now to ensure STR works first.
 
-      " Extract ID: Between <ID> and </ID>
-      FIND '<ID>' IN lv_xml_part MATCH OFFSET lv_off_start.
-      IF sy-subrc = 0.
-        lv_off_start = lv_off_start + 4. " Length of <ID>
-        FIND '</ID>' IN SECTION OFFSET lv_off_start OF lv_xml_part MATCH OFFSET lv_off_end.
-        IF sy-subrc = 0.
-          lv_len = lv_off_end - lv_off_start.
-          gs_final-xml_item_id = substring( val = lv_xml_part off = lv_off_start len = lv_len ).
-        ENDIF.
-      ENDIF.
+      " 4. Parse STR content
+      REPLACE ALL OCCURRENCES OF '&lt;' IN lv_str_content WITH '<'.
+      REPLACE ALL OCCURRENCES OF '&gt;' IN lv_str_content WITH '>'.
+      REPLACE ALL OCCURRENCES OF '&amp;' IN lv_str_content WITH '&'.
 
-      " Extract STR: Between <STR> and </STR>
-      FIND '<STR>' IN lv_xml_part MATCH OFFSET lv_off_start.
-      IF sy-subrc = 0.
-        lv_off_start = lv_off_start + 5. " Length of <STR>
-        FIND '</STR>' IN SECTION OFFSET lv_off_start OF lv_xml_part MATCH OFFSET lv_off_end.
-        IF sy-subrc = 0.
-          lv_len = lv_off_end - lv_off_start.
-          lv_str_content = substring( val = lv_xml_part off = lv_off_start len = lv_len ).
-          
-          " 4. Parse STR content: Key==Value||Key==Value
-          " Unescape XML entities if necessary (basic ones)
-          REPLACE ALL OCCURRENCES OF '&lt;' IN lv_str_content WITH '<'.
-          REPLACE ALL OCCURRENCES OF '&gt;' IN lv_str_content WITH '>'.
-          REPLACE ALL OCCURRENCES OF '&amp;' IN lv_str_content WITH '&'.
-
-          SPLIT lv_str_content AT '||' INTO TABLE lt_parts.
-          
-          LOOP AT lt_parts INTO lv_part.
-            SPLIT lv_part AT '==' INTO lv_key lv_value.
-            CONDENSE lv_key.
-            
-            CASE lv_key.
-              WHEN 'EWOID'.       gs_final-ewoid       = lv_value.
-              WHEN 'STATUS'.      gs_final-status      = lv_value.
-              WHEN 'LEVEL'.       gs_final-level       = lv_value.
-              WHEN 'SHORTTEXT'.   gs_final-shorttext   = lv_value.
-              WHEN 'DECISION_L2'. gs_final-decision_l2 = lv_value.
-              WHEN 'L2_SCORE_R'.  gs_final-score_r     = lv_value.
-              WHEN 'L2_SCORE_G'.  gs_final-score_g     = lv_value.
-              WHEN 'SCORE_YES_R'. IF gs_final-score_r IS INITIAL. gs_final-score_r = lv_value. ENDIF.
-              WHEN 'SCORE_YES_G'. IF gs_final-score_g IS INITIAL. gs_final-score_g = lv_value. ENDIF.
-            ENDCASE.
-          ENDLOOP.
-        ENDIF.
-      ENDIF.
+      SPLIT lv_str_content AT '||' INTO TABLE lt_parts.
+      
+      LOOP AT lt_parts INTO lv_part.
+        SPLIT lv_part AT '==' INTO lv_key lv_value.
+        CONDENSE lv_key.
+        
+        CASE lv_key.
+          WHEN 'EWOID'.       gs_final-ewoid       = lv_value.
+          WHEN 'STATUS'.      gs_final-status      = lv_value.
+          WHEN 'LEVEL'.       gs_final-level       = lv_value.
+          WHEN 'SHORTTEXT'.   gs_final-shorttext   = lv_value.
+          WHEN 'DECISION_L2'. gs_final-decision_l2 = lv_value.
+          WHEN 'L2_SCORE_R'.  gs_final-score_r     = lv_value.
+          WHEN 'L2_SCORE_G'.  gs_final-score_g     = lv_value.
+          WHEN 'SCORE_YES_R'. IF gs_final-score_r IS INITIAL. gs_final-score_r = lv_value. ENDIF.
+          WHEN 'SCORE_YES_G'. IF gs_final-score_g IS INITIAL. gs_final-score_g = lv_value. ENDIF.
+        ENDCASE.
+      ENDLOOP.
 
       APPEND gs_final TO gt_final.
-    ENDLOOP.
+      
+      " Advance offset
+      lv_sub_off = lv_match_off + lv_match_len.
+    ENDWHILE.
     
     IF lv_found_items = abap_false.
-        " If no <item> tags found, maybe it's just a single root object?
-        " Try to parse STR directly from the whole string as a fallback
-        FIND '<STR>' IN lv_full_xml_str MATCH OFFSET lv_off_start.
-        IF sy-subrc = 0.
-             gs_final-error_msg = 'Parsed single STR (No items found)'.
-             " ... (Extraction logic could be repeated here if needed)
-             " For now, just report error to keep it simple unless requested.
-        ELSE.
-             gs_final-error_msg = 'No Items/STR found in decoded XML'.
-        ENDIF.
+        gs_final-error_msg = 'No <STR> tags found'.
         APPEND gs_final TO gt_final.
     ENDIF.
 
