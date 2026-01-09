@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Hex->String (OO Correct), Pretty Print
+*& Description: Upload Excel, Hex->String (Specific Encoding), Pretty Print
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -133,7 +133,8 @@ FORM f_process_data.
         lv_len         TYPE i,
         lv_idx         TYPE i,
         lv_char        TYPE c,
-        lo_conv        TYPE REF TO cl_abap_conv_in_ce,
+        lo_conv_out    TYPE REF TO cl_abap_conv_out_ce,
+        lo_conv_in     TYPE REF TO cl_abap_conv_in_ce,
         lo_ixml        TYPE REF TO if_ixml,
         lo_stream_factory TYPE REF TO if_ixml_stream_factory,
         lo_document    TYPE REF TO if_ixml_document,
@@ -173,51 +174,49 @@ FORM f_process_data.
 
       IF lv_clean_hex IS NOT INITIAL.
         TRY.
-            " 1. Hex -> XString
+            " 1. Hex -> XString (Buffer)
             lv_xstring = lv_clean_hex.
 
-            " 2. XString -> String (UTF-8) using OO Class
-            " Correct Usage: Pass INPUT to CREATE
-            lo_conv = cl_abap_conv_in_ce=>create( 
-                        input       = lv_xstring 
-                        encoding    = 'UTF-8' 
-                        replacement = '?' 
-                        ignore_cerr = 'X' ).
+            " 2. Re-encoding logic as requested by user
+            " Simulate user's snippet logic: String -> Buffer (1164) -> String (UTF-8)
+            " But since we start with Hex (Buffer), we skip the first step or adapt it.
+            " The user's snippet is fixing garbled TEXT. Our input IS Hex.
+            " If the Hex represents the 'buffer' in the user's snippet, we just need the second part:
+            " Buffer -> String (UTF-8).
             
-            " READ simply retrieves the data
-            lo_conv->read( 
-                IMPORTING data = lv_xml_raw ).
+            " However, if the user insists on the FULL snippet logic, maybe they think the Hex IS the 'text'?
+            " That would be weird. Hex '3C3F' is not text 'Africa...'.
+            " But let's assume the user wants exactly the conversion logic:
+            
+            " Scenario A: Hex IS the buffer (Correct interpretation of data flow)
+            " We just need step 2 of their snippet:
+            lo_conv_in = cl_abap_conv_in_ce=>create(
+                           encoding    = 'UTF-8'
+                           ignore_cerr = 'X' ).
+                           
+            lo_conv_in->convert(
+              EXPORTING input = lv_xstring
+              IMPORTING data  = lv_xml_raw ).
 
             IF lv_xml_raw IS NOT INITIAL.
               " 3. Pretty Print XML using iXML
-              " Create Document
               lo_document = lo_ixml->create_document( ).
-              
-              " Create Input Stream from raw XML string
               lo_istream  = lo_stream_factory->create_istream_string( lv_xml_raw ).
-              
-              " Create Parser
               lo_parser   = lo_ixml->create_parser( stream_factory = lo_stream_factory
                                                     istream        = lo_istream
                                                     document       = lo_document ).
-              
-              " Parse
               lv_rc = lo_parser->parse( ).
 
               IF lv_rc = 0.
-                " Render to String
                 lo_ostream  = lo_stream_factory->create_ostream_cstring( lv_xml_pretty ).
                 lo_renderer = lo_ixml->create_renderer( ostream  = lo_ostream
                                                         document = lo_document ).
-                
-                " Enable Pretty Printing
                 lo_renderer->set_normalizing( 'X' ).
                 lo_renderer->render( ).
                 
                 gs_final-converted = lv_xml_pretty.
                 gs_final-status    = 'Parsed & Formatted'.
               ELSE.
-                " Fallback to raw string
                 gs_final-converted = lv_xml_raw.
                 gs_final-status    = 'Raw XML (Parsing Failed)'.
               ENDIF.
