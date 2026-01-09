@@ -1,21 +1,23 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Convert HEX to XML, Display Complete XML
+*& Description: Upload Excel, Convert HEX to XML, Split || Data, Dynamic ALV
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
-* Output Structure - Simple: Show complete XML
-TYPES: BEGIN OF ty_output,
-         record_id    TYPE string,      " Excel Record ID
-         item_id      TYPE string,      " Item ID from XML
-         complete_xml TYPE string,      " Complete XML content
-         status       TYPE string,      " Conversion status
-       END OF ty_output.
+* Intermediate storage for parsed XML items
+TYPES: BEGIN OF ty_raw_data,
+         record_id   TYPE string,
+         item_id     TYPE string,
+         raw_content TYPE string,
+       END OF ty_raw_data.
 
-DATA: gt_output TYPE TABLE OF ty_output,
-      gs_output TYPE ty_output,
-      gv_file   TYPE string.
+DATA: gt_raw_data TYPE TABLE OF ty_raw_data,
+      gs_raw_data TYPE ty_raw_data,
+      gv_file     TYPE string.
+
+* Dynamic ALV Data
+DATA: gr_alv_data TYPE REF TO data.
 
 SELECTION-SCREEN BEGIN OF BLOCK b1.
   PARAMETERS: p_file TYPE localfile OBLIGATORY.
@@ -27,7 +29,7 @@ AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
 START-OF-SELECTION.
   gv_file = p_file.
   PERFORM f_process_file.
-  PERFORM f_display_alv.
+  PERFORM f_prepare_and_display_alv.
 
 *&---------------------------------------------------------------------*
 *& Form f_file_open
@@ -159,7 +161,7 @@ FORM f_process_file.
           ENDTRY.
         ENDIF.
 
-        PERFORM f_convert_and_parse
+        PERFORM f_convert_and_collect
           USING lv_record_id lv_hex_raw.
 
       ENDLOOP.
@@ -171,9 +173,9 @@ FORM f_process_file.
 ENDFORM.
 
 *&---------------------------------------------------------------------*
-*& Form f_convert_and_parse
+*& Form f_convert_and_collect
 *&---------------------------------------------------------------------*
-FORM f_convert_and_parse
+FORM f_convert_and_collect
   USING pv_record_id TYPE string
         pv_hex       TYPE string.
 
@@ -212,12 +214,9 @@ FORM f_convert_and_parse
 
       " Convert to xstring
       CLEAR lv_xstr.
-      
-      " Optimized hex to xstring conversion
       TRY.
           lv_xstr = lv_clean.
         CATCH cx_sy_conversion_error.
-          " Fallback to manual loop if direct assignment fails
           lv_offset = 0.
           WHILE lv_offset < lv_len.
             lv_hex_pair = lv_clean+lv_offset(2).
@@ -227,7 +226,7 @@ FORM f_convert_and_parse
           ENDWHILE.
       ENDTRY.
 
-      " Convert to string using CL_ABAP_CONV_IN_CE
+      " Convert to string
       TRY.
           lo_conv = cl_abap_conv_in_ce=>create( 
                       input = lv_xstr 
@@ -242,17 +241,18 @@ FORM f_convert_and_parse
 
       IF lv_xml_string IS INITIAL. RETURN. ENDIF.
 
-      " Parse items - Extract ID and complete STR content
       lv_remaining = lv_xml_string.
 
       DO 1000 TIMES.
+        IF lv_remaining IS INITIAL. EXIT. ENDIF.
+
         FIND '<item>' IN lv_remaining MATCH OFFSET lv_search_pos.
         IF sy-subrc <> 0. EXIT. ENDIF.
 
         FIND '</item>' IN lv_remaining MATCH OFFSET lv_end_pos.
         IF sy-subrc <> 0. EXIT. ENDIF.
 
-        " Include length of closing tag
+        " Include length of closing tag (7 chars)
         lv_len = lv_end_pos - lv_search_pos + 7. 
 
         IF lv_len > 0 AND lv_len <= strlen( lv_remaining ).
@@ -263,26 +263,24 @@ FORM f_convert_and_parse
 
         CLEAR: lv_id_value, lv_str_value.
 
-        " Extract ID
         PERFORM f_extract_tag
           USING lv_item_block 'ID'
           CHANGING lv_id_value.
 
-        " Extract complete STR content
         PERFORM f_extract_tag_complete
           USING lv_item_block 'STR'
           CHANGING lv_str_value.
 
-        " Add to output
         IF lv_id_value IS NOT INITIAL OR lv_str_value IS NOT INITIAL.
-          CLEAR gs_output.
-          gs_output-record_id = pv_record_id.
-          gs_output-item_id = lv_id_value.
-          gs_output-complete_xml = lv_str_value.
-          gs_output-status = 'Success'.
-          APPEND gs_output TO gt_output.
+          CLEAR gs_raw_data.
+          gs_raw_data-record_id = pv_record_id.
+          gs_raw_data-item_id = lv_id_value.
+          gs_raw_data-raw_content = lv_str_value.
+          APPEND gs_raw_data TO gt_raw_data.
         ENDIF.
 
+        " Advance remaining string past the current item
+        lv_end_pos = lv_end_pos + 7.
         IF lv_end_pos < strlen( lv_remaining ).
           lv_remaining = lv_remaining+lv_end_pos.
         ELSE.
@@ -332,108 +330,124 @@ FORM f_extract_tag_complete
   USING pv_xml     TYPE string
         pv_tag     TYPE string
   CHANGING pv_value TYPE string.
-
-  DATA: lv_start_tag TYPE string,
-        lv_end_tag   TYPE string,
-        lv_start_pos TYPE i,
-        lv_end_pos   TYPE i,
-        lv_temp      TYPE string,
-        lv_xml_len   TYPE i,
-        lv_temp_len  TYPE i.
-
-  CLEAR pv_value.
-
-  CONCATENATE '<' pv_tag '>' INTO lv_start_tag.
-  CONCATENATE '</' pv_tag '>' INTO lv_end_tag.
-
-  lv_xml_len = strlen( pv_xml ).
-
-  FIND lv_start_tag IN pv_xml MATCH OFFSET lv_start_pos.
-  IF sy-subrc = 0.
-    lv_start_pos = lv_start_pos + strlen( lv_start_tag ).
-
-    IF lv_start_pos < lv_xml_len.
-      lv_temp = pv_xml+lv_start_pos.
-      lv_temp_len = strlen( lv_temp ).
-
-      FIND lv_end_tag IN lv_temp MATCH OFFSET lv_end_pos.
-      IF sy-subrc = 0 AND lv_end_pos > 0.
-        pv_value = lv_temp(lv_end_pos).
-      ELSEIF sy-subrc <> 0.
-        pv_value = lv_temp.
-      ENDIF.
-    ENDIF.
-  ENDIF.
+  
+  PERFORM f_extract_tag USING pv_xml pv_tag CHANGING pv_value.
 ENDFORM.
 
 *&---------------------------------------------------------------------*
-*& Form f_display_alv
+*& Form f_prepare_and_display_alv
 *&---------------------------------------------------------------------*
-FORM f_display_alv.
-  DATA: lo_alv       TYPE REF TO cl_salv_table,
-        lo_columns   TYPE REF TO cl_salv_columns_table,
-        lo_column    TYPE REF TO cl_salv_column_table,
-        lo_functions TYPE REF TO cl_salv_functions_list,
-        lo_display   TYPE REF TO cl_salv_display_settings.
+FORM f_prepare_and_display_alv.
+  DATA: lt_fcat       TYPE lvc_t_fcat,
+        ls_fcat       TYPE lvc_s_fcat,
+        lo_alv        TYPE REF TO cl_salv_table,
+        lt_splits     TYPE TABLE OF string,
+        lv_max_cols   TYPE i,
+        lv_col_name   TYPE string,
+        lv_col_idx    TYPE i,
+        ls_raw        LIKE LINE OF gt_raw_data,
+        lv_split_val  TYPE string.
 
-  IF gt_output IS INITIAL.
-    MESSAGE 'No data to display' TYPE 'S' DISPLAY LIKE 'W'.
+  FIELD-SYMBOLS: <lt_dyn_table> TYPE STANDARD TABLE,
+                 <ls_dyn_line>  TYPE any,
+                 <lv_field>     TYPE any.
+
+  IF gt_raw_data IS INITIAL.
+    MESSAGE 'No data extracted.' TYPE 'S' DISPLAY LIKE 'W'.
     RETURN.
   ENDIF.
 
+  " 1. Determine maximum number of columns
+  lv_max_cols = 0.
+  LOOP AT gt_raw_data INTO ls_raw.
+    SPLIT ls_raw-raw_content AT '||' INTO TABLE lt_splits.
+    IF lines( lt_splits ) > lv_max_cols.
+      lv_max_cols = lines( lt_splits ).
+    ENDIF.
+  ENDLOOP.
+
+  IF lv_max_cols = 0. lv_max_cols = 1. ENDIF.
+
+  " 2. Build Field Catalog
+  " Fixed columns
+  ls_fcat-fieldname = 'RECORD_ID'.
+  ls_fcat-ref_table = 'NA'.
+  ls_fcat-scrtext_s = 'RecID'.
+  ls_fcat-scrtext_m = 'Record ID'.
+  ls_fcat-scrtext_l = 'Record ID'.
+  ls_fcat-inttype   = 'g'. " String
+  ls_fcat-col_opt   = 'X'.
+  APPEND ls_fcat TO lt_fcat.
+
+  ls_fcat-fieldname = 'ITEM_ID'.
+  ls_fcat-scrtext_s = 'ItemID'.
+  ls_fcat-scrtext_m = 'Item ID'.
+  ls_fcat-scrtext_l = 'Item ID'.
+  ls_fcat-inttype   = 'g'.
+  ls_fcat-col_opt   = 'X'.
+  APPEND ls_fcat TO lt_fcat.
+
+  " Dynamic columns
+  DO lv_max_cols TIMES.
+    lv_col_idx = sy-index.
+    lv_col_name = |COL_{ lv_col_idx }|. 
+    
+    CLEAR ls_fcat.
+    ls_fcat-fieldname = lv_col_name.
+    ls_fcat-scrtext_s = |Col { lv_col_idx }|.
+    ls_fcat-scrtext_m = |Column { lv_col_idx }|.
+    ls_fcat-scrtext_l = |Data Column { lv_col_idx }|.
+    ls_fcat-inttype   = 'g'. " String
+    ls_fcat-col_opt   = 'X'.
+    APPEND ls_fcat TO lt_fcat.
+  ENDDO.
+
+  " 3. Create Dynamic Table
+  CALL METHOD cl_alv_table_create=>create_dynamic_table
+    EXPORTING
+      it_fieldcatalog = lt_fcat
+    IMPORTING
+      ep_table        = gr_alv_data.
+
+  ASSIGN gr_alv_data->* TO <lt_dyn_table>.
+
+  " 4. Fill Data
+  LOOP AT gt_raw_data INTO ls_raw.
+    APPEND INITIAL LINE TO <lt_dyn_table> ASSIGNING <ls_dyn_line>.
+
+    " Fill Fixed Fields
+    ASSIGN COMPONENT 'RECORD_ID' OF STRUCTURE <ls_dyn_line> TO <lv_field>.
+    IF sy-subrc = 0. <lv_field> = ls_raw-record_id. ENDIF.
+
+    ASSIGN COMPONENT 'ITEM_ID' OF STRUCTURE <ls_dyn_line> TO <lv_field>.
+    IF sy-subrc = 0. <lv_field> = ls_raw-item_id. ENDIF.
+
+    " Fill Dynamic Fields
+    SPLIT ls_raw-raw_content AT '||' INTO TABLE lt_splits.
+    
+    LOOP AT lt_splits INTO lv_split_val.
+      lv_col_idx = sy-tabix.
+      lv_col_name = |COL_{ lv_col_idx }|.
+      
+      ASSIGN COMPONENT lv_col_name OF STRUCTURE <ls_dyn_line> TO <lv_field>.
+      IF sy-subrc = 0.
+        <lv_field> = lv_split_val.
+      ENDIF.
+    ENDLOOP.
+  ENDLOOP.
+
+  " 5. Display ALV
   TRY.
       cl_salv_table=>factory(
         IMPORTING
           r_salv_table = lo_alv
         CHANGING
-          t_table = gt_output ).
+          t_table = <lt_dyn_table> ).
 
-      lo_functions = lo_alv->get_functions( ).
-      lo_functions->set_all( abap_true ).
-
-      lo_display = lo_alv->get_display_settings( ).
-      lo_display->set_striped_pattern( abap_true ).
-      lo_display->set_list_header( 'Complete XML Data Extraction' ).
-
-      lo_columns = lo_alv->get_columns( ).
-      lo_columns->set_optimize( abap_true ).
-
-      " Configure columns
-      TRY.
-          lo_column ?= lo_columns->get_column( 'RECORD_ID' ).
-          lo_column->set_long_text( 'Record ID' ).
-          lo_column->set_medium_text( 'Record ID' ).
-          lo_column->set_short_text( 'Rec ID' ).
-          lo_column->set_output_length( 12 ).
-        CATCH cx_salv_not_found.
-      ENDTRY.
-
-      TRY.
-          lo_column ?= lo_columns->get_column( 'ITEM_ID' ).
-          lo_column->set_long_text( 'Item ID' ).
-          lo_column->set_medium_text( 'Item ID' ).
-          lo_column->set_short_text( 'Item' ).
-          lo_column->set_output_length( 15 ).
-        CATCH cx_salv_not_found.
-      ENDTRY.
-
-      TRY.
-          lo_column ?= lo_columns->get_column( 'COMPLETE_XML' ).
-          lo_column->set_long_text( 'Complete XML Content' ).
-          lo_column->set_medium_text( 'XML Content' ).
-          lo_column->set_short_text( 'XML' ).
-          " lo_column->set_output_length( 200 ).
-        CATCH cx_salv_not_found.
-      ENDTRY.
-
-      TRY.
-          lo_column ?= lo_columns->get_column( 'STATUS' ).
-          lo_column->set_long_text( 'Status' ).
-          lo_column->set_medium_text( 'Status' ).
-          lo_column->set_short_text( 'Status' ).
-          lo_column->set_output_length( 15 ).
-        CATCH cx_salv_not_found.
-      ENDTRY.
+      lo_alv->get_functions( )->set_all( abap_true ).
+      lo_alv->get_columns( )->set_optimize( abap_true ).
+      lo_alv->get_display_settings( )->set_striped_pattern( abap_true ).
+      lo_alv->get_display_settings( )->set_list_header( 'Splitted XML Data' ).
 
       lo_alv->display( ).
 
