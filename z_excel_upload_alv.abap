@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Hex->String (Specific Encoding), Pretty Print
+*& Description: Upload Excel, Hex->String (cl_bcs_convert), Pretty Print
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -133,8 +133,6 @@ FORM f_process_data.
         lv_len         TYPE i,
         lv_idx         TYPE i,
         lv_char        TYPE c,
-        lo_conv_out    TYPE REF TO cl_abap_conv_out_ce,
-        lo_conv_in     TYPE REF TO cl_abap_conv_in_ce,
         lo_ixml        TYPE REF TO if_ixml,
         lo_stream_factory TYPE REF TO if_ixml_stream_factory,
         lo_document    TYPE REF TO if_ixml_document,
@@ -174,29 +172,19 @@ FORM f_process_data.
 
       IF lv_clean_hex IS NOT INITIAL.
         TRY.
-            " 1. Hex -> XString (Buffer)
+            " 1. Hex -> XString
             lv_xstring = lv_clean_hex.
 
-            " 2. Re-encoding logic as requested by user
-            " Simulate user's snippet logic: String -> Buffer (1164) -> String (UTF-8)
-            " But since we start with Hex (Buffer), we skip the first step or adapt it.
-            " The user's snippet is fixing garbled TEXT. Our input IS Hex.
-            " If the Hex represents the 'buffer' in the user's snippet, we just need the second part:
-            " Buffer -> String (UTF-8).
-            
-            " However, if the user insists on the FULL snippet logic, maybe they think the Hex IS the 'text'?
-            " That would be weird. Hex '3C3F' is not text 'Africa...'.
-            " But let's assume the user wants exactly the conversion logic:
-            
-            " Scenario A: Hex IS the buffer (Correct interpretation of data flow)
-            " We just need step 2 of their snippet:
-            lo_conv_in = cl_abap_conv_in_ce=>create(
-                           encoding    = 'UTF-8'
-                           ignore_cerr = 'X' ).
-                           
-            lo_conv_in->convert(
-              EXPORTING input = lv_xstring
-              IMPORTING data  = lv_xml_raw ).
+            " 2. XString -> String using CL_BCS_CONVERT
+            " This class handles code pages robustly
+            TRY.
+                lv_xml_raw = cl_bcs_convert=>xstring_to_string(
+                               iv_xstring  = lv_xstring
+                               iv_codepage = '4110' ). " UTF-8
+
+              CATCH cx_bcs.
+                gs_final-status = 'BCS Conversion Failed'.
+            ENDTRY.
 
             IF lv_xml_raw IS NOT INITIAL.
               " 3. Pretty Print XML using iXML
@@ -211,21 +199,24 @@ FORM f_process_data.
                 lo_ostream  = lo_stream_factory->create_ostream_cstring( lv_xml_pretty ).
                 lo_renderer = lo_ixml->create_renderer( ostream  = lo_ostream
                                                         document = lo_document ).
+                
                 lo_renderer->set_normalizing( 'X' ).
                 lo_renderer->render( ).
                 
                 gs_final-converted = lv_xml_pretty.
-                gs_final-status    = 'Parsed & Formatted'.
+                gs_final-status    = 'Success'.
               ELSE.
                 gs_final-converted = lv_xml_raw.
-                gs_final-status    = 'Raw XML (Parsing Failed)'.
+                gs_final-status    = 'Raw XML (Parse Error)'.
               ENDIF.
             ELSE.
-               gs_final-status = 'Empty Result'.
+               IF gs_final-status IS INITIAL.
+                 gs_final-status = 'Empty Result'.
+               ENDIF.
             ENDIF.
 
           CATCH cx_root.
-            gs_final-status = 'Conversion Failed'.
+            gs_final-status = 'General Error'.
         ENDTRY.
       ELSE.
         gs_final-status = 'No Valid Hex'.
