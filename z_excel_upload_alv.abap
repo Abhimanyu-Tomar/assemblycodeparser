@@ -370,8 +370,8 @@ FORM f_prepare_and_display_alv.
 
   " 2. Build Field Catalog
   " Fixed columns
+  CLEAR ls_fcat.
   ls_fcat-fieldname = 'RECORD_ID'.
-  ls_fcat-ref_table = 'NA'.
   ls_fcat-scrtext_s = 'RecID'.
   ls_fcat-scrtext_m = 'Record ID'.
   ls_fcat-scrtext_l = 'Record ID'.
@@ -379,6 +379,7 @@ FORM f_prepare_and_display_alv.
   ls_fcat-col_opt   = 'X'.
   APPEND ls_fcat TO lt_fcat.
 
+  CLEAR ls_fcat.
   ls_fcat-fieldname = 'ITEM_ID'.
   ls_fcat-scrtext_s = 'ItemID'.
   ls_fcat-scrtext_m = 'Item ID'.
