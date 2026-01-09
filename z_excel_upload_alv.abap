@@ -9,6 +9,8 @@ REPORT z_excel_upload_alv.
 TYPES: BEGIN OF ty_raw_data,
          record_id   TYPE string,
          item_id     TYPE string,
+         hex_col_b   TYPE string, " Original Hex Column B
+         hex_col_c   TYPE string, " Original Hex Column C
          raw_content TYPE string,
        END OF ty_raw_data.
 
@@ -59,18 +61,19 @@ ENDFORM.
 *& Form f_process_file
 *&---------------------------------------------------------------------*
 FORM f_process_file.
-  DATA: lt_bin         TYPE solix_tab,
-        lv_xstring     TYPE xstring,
-        lv_len         TYPE i,
-        lo_excel       TYPE REF TO cl_fdt_xl_spreadsheet,
-        lt_worksheets  TYPE if_fdt_doc_spreadsheet=>t_worksheet_names,
-        lr_data        TYPE REF TO data,
-        lv_hex_raw     TYPE string,
-        lv_sheet       TYPE string,
-        lv_temp        TYPE string,
-        lv_record_id   TYPE string,
-        lo_error       TYPE REF TO cx_root,
-        lv_error_text  TYPE string.
+  DATA: lt_bin          TYPE solix_tab,
+        lv_xstring      TYPE xstring,
+        lv_len          TYPE i,
+        lo_excel        TYPE REF TO cl_fdt_xl_spreadsheet,
+        lt_worksheets   TYPE if_fdt_doc_spreadsheet=>t_worksheet_names,
+        lr_data         TYPE REF TO data,
+        lv_col_b        TYPE string,
+        lv_col_c        TYPE string,
+        lv_hex_process  TYPE string,
+        lv_sheet        TYPE string,
+        lv_record_id    TYPE string,
+        lo_error        TYPE REF TO cx_root,
+        lv_error_text   TYPE string.
 
   FIELD-SYMBOLS: <lt_data> TYPE STANDARD TABLE,
                  <ls_row>  TYPE any,
@@ -125,9 +128,9 @@ FORM f_process_file.
       LOOP AT <lt_data> ASSIGNING <ls_row>.
         IF sy-tabix = 1. CONTINUE. ENDIF.
 
-        CLEAR: lv_hex_raw, lv_temp, lv_record_id.
+        CLEAR: lv_col_b, lv_col_c, lv_hex_process, lv_record_id.
 
-        " Column 1
+        " Column 1 - Record ID
         ASSIGN COMPONENT 1 OF STRUCTURE <ls_row> TO <lv_val>.
         IF sy-subrc = 0 AND <lv_val> IS ASSIGNED.
           TRY.
@@ -137,32 +140,34 @@ FORM f_process_file.
           ENDTRY.
         ENDIF.
 
-        " Column 2
+        " Column 2 - Hex Data (Column B)
         ASSIGN COMPONENT 2 OF STRUCTURE <ls_row> TO <lv_val>.
         IF sy-subrc = 0 AND <lv_val> IS ASSIGNED.
           TRY.
-              lv_hex_raw = <lv_val>.
-              CONDENSE lv_hex_raw NO-GAPS.
+              lv_col_b = <lv_val>.
+              CONDENSE lv_col_b NO-GAPS.
             CATCH cx_root.
           ENDTRY.
         ENDIF.
 
-        " Column 3
+        " Column 3 - Additional Hex Data (Column C)
         ASSIGN COMPONENT 3 OF STRUCTURE <ls_row> TO <lv_val>.
         IF sy-subrc = 0 AND <lv_val> IS ASSIGNED.
           TRY.
-              lv_temp = <lv_val>.
-              CONDENSE lv_temp NO-GAPS.
-
-              IF strlen( lv_hex_raw ) < 50 AND strlen( lv_temp ) > 50.
-                lv_hex_raw = lv_temp.
-              ENDIF.
+              lv_col_c = <lv_val>.
+              CONDENSE lv_col_c NO-GAPS.
             CATCH cx_root.
           ENDTRY.
         ENDIF.
 
+        " Determine which hex to process (Logic from original request)
+        lv_hex_process = lv_col_b.
+        IF strlen( lv_col_b ) < 50 AND strlen( lv_col_c ) > 50.
+          lv_hex_process = lv_col_c.
+        ENDIF.
+
         PERFORM f_convert_and_collect
-          USING lv_record_id lv_hex_raw.
+          USING lv_record_id lv_col_b lv_col_c lv_hex_process.
 
       ENDLOOP.
 
@@ -177,6 +182,8 @@ ENDFORM.
 *&---------------------------------------------------------------------*
 FORM f_convert_and_collect
   USING pv_record_id TYPE string
+        pv_col_b     TYPE string
+        pv_col_c     TYPE string
         pv_hex       TYPE string.
 
   DATA: lv_clean      TYPE string,
@@ -274,7 +281,9 @@ FORM f_convert_and_collect
         IF lv_id_value IS NOT INITIAL OR lv_str_value IS NOT INITIAL.
           CLEAR gs_raw_data.
           gs_raw_data-record_id = pv_record_id.
-          gs_raw_data-item_id = lv_id_value.
+          gs_raw_data-hex_col_b = pv_col_b. " Store original B
+          gs_raw_data-hex_col_c = pv_col_c. " Store original C
+          gs_raw_data-item_id   = lv_id_value.
           gs_raw_data-raw_content = lv_str_value.
           APPEND gs_raw_data TO gt_raw_data.
         ENDIF.
@@ -380,6 +389,24 @@ FORM f_prepare_and_display_alv.
   APPEND ls_fcat TO lt_fcat.
 
   CLEAR ls_fcat.
+  ls_fcat-fieldname = 'HEX_COL_B'.
+  ls_fcat-scrtext_s = 'HexColB'.
+  ls_fcat-scrtext_m = 'Hex Column B'.
+  ls_fcat-scrtext_l = 'Original Hex Column B'.
+  ls_fcat-inttype   = 'g'.
+  ls_fcat-col_opt   = 'X'.
+  APPEND ls_fcat TO lt_fcat.
+
+  CLEAR ls_fcat.
+  ls_fcat-fieldname = 'HEX_COL_C'.
+  ls_fcat-scrtext_s = 'HexColC'.
+  ls_fcat-scrtext_m = 'Hex Column C'.
+  ls_fcat-scrtext_l = 'Original Hex Column C'.
+  ls_fcat-inttype   = 'g'.
+  ls_fcat-col_opt   = 'X'.
+  APPEND ls_fcat TO lt_fcat.
+
+  CLEAR ls_fcat.
   ls_fcat-fieldname = 'ITEM_ID'.
   ls_fcat-scrtext_s = 'ItemID'.
   ls_fcat-scrtext_m = 'Item ID'.
@@ -419,6 +446,12 @@ FORM f_prepare_and_display_alv.
     " Fill Fixed Fields
     ASSIGN COMPONENT 'RECORD_ID' OF STRUCTURE <ls_dyn_line> TO <lv_field>.
     IF sy-subrc = 0. <lv_field> = ls_raw-record_id. ENDIF.
+
+    ASSIGN COMPONENT 'HEX_COL_B' OF STRUCTURE <ls_dyn_line> TO <lv_field>.
+    IF sy-subrc = 0. <lv_field> = ls_raw-hex_col_b. ENDIF.
+
+    ASSIGN COMPONENT 'HEX_COL_C' OF STRUCTURE <ls_dyn_line> TO <lv_field>.
+    IF sy-subrc = 0. <lv_field> = ls_raw-hex_col_c. ENDIF.
 
     ASSIGN COMPONENT 'ITEM_ID' OF STRUCTURE <ls_dyn_line> TO <lv_field>.
     IF sy-subrc = 0. <lv_field> = ls_raw-item_id. ENDIF.
