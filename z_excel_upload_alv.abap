@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Hex->String (cl_bcs_convert), Pretty Print
+*& Description: Upload Excel, Hex->XString->XML Parsing (Robust)
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -19,7 +19,7 @@ TYPES: BEGIN OF ty_final,
          col_a     TYPE string,
          converted TYPE string,      " Formatted XML
          col_c     TYPE string,
-         status    TYPE string,
+         status    TYPE string,      " Status / Error Message
        END OF ty_final.
 
 *----------------------------------------------------------------------*
@@ -140,6 +140,7 @@ FORM f_process_data.
         lo_renderer    TYPE REF TO if_ixml_renderer,
         lo_istream     TYPE REF TO if_ixml_istream,
         lo_ostream     TYPE REF TO if_ixml_ostream,
+        lo_error       TYPE REF TO if_ixml_parse_error,
         lv_rc          TYPE i.
 
   " Initialize iXML Factory
@@ -175,48 +176,50 @@ FORM f_process_data.
             " 1. Hex -> XString
             lv_xstring = lv_clean_hex.
 
-            " 2. XString -> String using CL_BCS_CONVERT
-            " This class handles code pages robustly
-            TRY.
-                lv_xml_raw = cl_bcs_convert=>xstring_to_string(
-                               iv_xstring  = lv_xstring
-                               iv_codepage = '4110' ). " UTF-8
+            " 2. Direct Parsing from XSTRING
+            " This avoids encoding mismatch errors (e.g. BOMs or UTF-8 header vs ABAP String)
+            lo_document = lo_ixml->create_document( ).
+            lo_istream  = lo_stream_factory->create_istream_xstring( lv_xstring ).
+            lo_parser   = lo_ixml->create_parser( stream_factory = lo_stream_factory
+                                                  istream        = lo_istream
+                                                  document       = lo_document ).
+            lv_rc = lo_parser->parse( ).
 
-              CATCH cx_bcs.
-                gs_final-status = 'BCS Conversion Failed'.
-            ENDTRY.
-
-            IF lv_xml_raw IS NOT INITIAL.
-              " 3. Pretty Print XML using iXML
-              lo_document = lo_ixml->create_document( ).
-              lo_istream  = lo_stream_factory->create_istream_string( lv_xml_raw ).
-              lo_parser   = lo_ixml->create_parser( stream_factory = lo_stream_factory
-                                                    istream        = lo_istream
-                                                    document       = lo_document ).
-              lv_rc = lo_parser->parse( ).
-
-              IF lv_rc = 0.
-                lo_ostream  = lo_stream_factory->create_ostream_cstring( lv_xml_pretty ).
-                lo_renderer = lo_ixml->create_renderer( ostream  = lo_ostream
-                                                        document = lo_document ).
-                
-                lo_renderer->set_normalizing( 'X' ).
-                lo_renderer->render( ).
-                
-                gs_final-converted = lv_xml_pretty.
-                gs_final-status    = 'Success'.
-              ELSE.
-                gs_final-converted = lv_xml_raw.
-                gs_final-status    = 'Raw XML (Parse Error)'.
-              ENDIF.
+            IF lv_rc = 0.
+              " Success: Pretty Print
+              lo_ostream  = lo_stream_factory->create_ostream_cstring( lv_xml_pretty ).
+              lo_renderer = lo_ixml->create_renderer( ostream  = lo_ostream
+                                                      document = lo_document ).
+              
+              lo_renderer->set_normalizing( 'X' ).
+              lo_renderer->render( ).
+              
+              gs_final-converted = lv_xml_pretty.
+              gs_final-status    = 'Success'.
             ELSE.
-               IF gs_final-status IS INITIAL.
-                 gs_final-status = 'Empty Result'.
-               ENDIF.
+              " Parse Error: Fallback to Raw Conversion for display
+              " We use CL_BCS_CONVERT or similar as fallback
+              TRY.
+                  lv_xml_raw = cl_bcs_convert=>xstring_to_string(
+                                 iv_xstring  = lv_xstring
+                                 iv_codepage = '4110' ). " UTF-8
+                  
+                  gs_final-converted = lv_xml_raw.
+                  
+                  " Capture Specific Error
+                  lo_error = lo_parser->get_error( index = 0 ).
+                  IF lo_error IS BOUND.
+                    gs_final-status = lo_error->get_reason( ).
+                  ELSE.
+                    gs_final-status = 'XML Parse Error'.
+                  ENDIF.
+                CATCH cx_root.
+                  gs_final-status = 'Fatal Error'.
+              ENDTRY.
             ENDIF.
 
           CATCH cx_root.
-            gs_final-status = 'General Error'.
+            gs_final-status = 'Conversion Failed'.
         ENDTRY.
       ELSE.
         gs_final-status = 'No Valid Hex'.
