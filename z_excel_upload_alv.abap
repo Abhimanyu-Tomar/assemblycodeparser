@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel (CL_FDT), Hex->String, Pretty Print
+*& Description: Upload Excel (Robust Type Check), Hex->String, Pretty Print
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -68,7 +68,7 @@ FORM f_process_file.
                  <ls_row>  TYPE any,
                  <lv_val>  TYPE any.
 
-  " 1. Read File to XSTRING (Avoids Truncation of TEXT_CONVERT_...)
+  " 1. Read File to XSTRING
   cl_gui_frontend_services=>gui_upload(
     EXPORTING
       filename   = gv_file
@@ -119,20 +119,27 @@ FORM f_process_file.
 
         CLEAR: gs_final, lv_hex_raw.
         
-        " Map Columns dynamically
+        " Map Columns safely (Catching Move Errors)
         ASSIGN COMPONENT 1 OF STRUCTURE <ls_row> TO <lv_val>.
-        IF sy-subrc = 0. gs_final-col_a = <lv_val>. ENDIF.
+        IF sy-subrc = 0.
+          TRY. gs_final-col_a = <lv_val>. CATCH cx_root. ENDTRY.
+        ENDIF.
 
         ASSIGN COMPONENT 2 OF STRUCTURE <ls_row> TO <lv_val>.
-        IF sy-subrc = 0. lv_hex_raw = <lv_val>. ENDIF.
+        IF sy-subrc = 0.
+          TRY. lv_hex_raw = <lv_val>. CATCH cx_root. ENDTRY.
+        ENDIF.
 
         ASSIGN COMPONENT 3 OF STRUCTURE <ls_row> TO <lv_val>.
-        IF sy-subrc = 0. 
-           IF strlen( lv_hex_raw ) < 20 AND strlen( <lv_val> ) > 20.
-             lv_hex_raw = <lv_val>. " Use Col 3 if Col 2 is empty/short
-           ELSE.
-             gs_final-col_c = <lv_val>.
-           ENDIF.
+        IF sy-subrc = 0.
+           TRY.
+             IF strlen( lv_hex_raw ) < 20 AND strlen( <lv_val> ) > 20.
+               lv_hex_raw = <lv_val>. 
+             ELSE.
+               gs_final-col_c = <lv_val>.
+             ENDIF.
+           CATCH cx_root.
+           ENDTRY.
         ENDIF.
 
         " 3. Process Hex
