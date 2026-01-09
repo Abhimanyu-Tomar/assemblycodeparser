@@ -1,266 +1,233 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Hex->XString->XML Parsing (Robust)
+*& Description: Upload Excel (CL_FDT), Hex->String, Pretty Print
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
-
-*----------------------------------------------------------------------*
-* Type Definitions
-*----------------------------------------------------------------------*
-TYPES: BEGIN OF ty_excel_raw,
-         col_a TYPE string,      " Field 1
-         col_b TYPE string,      " Field 2 (Hex String)
-         col_c TYPE string,      " Field 3
-       END OF ty_excel_raw.
 
 * Output Structure
 TYPES: BEGIN OF ty_final,
          col_a     TYPE string,
          converted TYPE string,      " Formatted XML
          col_c     TYPE string,
-         status    TYPE string,      " Status / Error Message
+         status    TYPE string,
        END OF ty_final.
 
-*----------------------------------------------------------------------*
-* Data Declarations
-*----------------------------------------------------------------------*
-DATA: gt_excel_raw TYPE TABLE OF ty_excel_raw,
-      gt_final     TYPE TABLE OF ty_final,
-      gs_final     TYPE ty_final,
-      gv_file      TYPE rlgrap-filename.
+DATA: gt_final TYPE TABLE OF ty_final,
+      gs_final TYPE ty_final,
+      gv_file  TYPE string.
 
-*----------------------------------------------------------------------*
-* Selection Screen
-*----------------------------------------------------------------------*
-SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+SELECTION-SCREEN BEGIN OF BLOCK b1.
   PARAMETERS: p_file TYPE localfile OBLIGATORY.
 SELECTION-SCREEN END OF BLOCK b1.
 
-*----------------------------------------------------------------------*
-* Initialization
-*----------------------------------------------------------------------*
-INITIALIZATION.
-  TEXT-001 = 'File Selection'.
-
-*----------------------------------------------------------------------*
-* At Selection Screen
-*----------------------------------------------------------------------*
 AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
   PERFORM f_file_open.
 
-*----------------------------------------------------------------------*
-* Start of Selection
-*----------------------------------------------------------------------*
 START-OF-SELECTION.
-  PERFORM f_upload_excel.
-
-  IF gt_excel_raw IS INITIAL.
-    MESSAGE 'No data found in Excel file.' TYPE 'S' DISPLAY LIKE 'E'.
-  ELSE.
-    PERFORM f_process_data.
-    PERFORM f_display_alv.
-  ENDIF.
+  gv_file = p_file.
+  PERFORM f_process_file.
+  PERFORM f_display_alv.
 
 *&---------------------------------------------------------------------*
 *& Form f_file_open
 *&---------------------------------------------------------------------*
 FORM f_file_open.
   DATA: lt_file_table TYPE filetable,
-        lv_rc         TYPE i,
-        lv_user_action TYPE i.
+        lv_rc         TYPE i.
 
   cl_gui_frontend_services=>file_open_dialog(
     EXPORTING
-      window_title            = 'Select Excel File'
-      default_extension       = 'xlsx'
-      file_filter             = 'Excel Files (*.xlsx;*.xls)|*.xlsx;*.xls|All Files (*.*)|*.*'
+      window_title      = 'Select Excel File'
+      default_extension = 'xlsx'
+      file_filter       = 'Excel Files (*.xlsx)|*.xlsx'
     CHANGING
-      file_table              = lt_file_table
-      rc                      = lv_rc
-      user_action             = lv_user_action
-    EXCEPTIONS
-      file_open_dialog_failed = 1
-      cntl_error              = 2
-      error_no_gui            = 3
-      not_supported_by_gui    = 4
-      OTHERS                  = 5
-  ).
+      file_table        = lt_file_table
+      rc                = lv_rc
+    EXCEPTIONS OTHERS   = 1 ).
 
-  IF sy-subrc = 0 AND lv_user_action <> cl_gui_frontend_services=>action_cancel.
+  IF sy-subrc = 0 AND lines( lt_file_table ) > 0.
     READ TABLE lt_file_table INTO DATA(ls_file) INDEX 1.
-    IF sy-subrc = 0.
-      p_file = ls_file-filename.
-    ENDIF.
+    p_file = ls_file-filename.
   ENDIF.
 ENDFORM.
 
 *&---------------------------------------------------------------------*
-*& Form f_upload_excel
+*& Form f_process_file
 *&---------------------------------------------------------------------*
-FORM f_upload_excel.
-  DATA: lt_raw_data TYPE truxs_t_text_data,
-        lv_filename TYPE rlgrap-filename.
+FORM f_process_file.
+  DATA: lt_bin         TYPE solix_tab,
+        lv_xstring     TYPE xstring,
+        lv_len         TYPE i,
+        lo_excel       TYPE REF TO cl_fdt_xl_spreadsheet,
+        lt_worksheets  TYPE if_fdt_doc_spreadsheet=>t_worksheet_names,
+        lr_data        TYPE REF TO data,
+        lv_hex_raw     TYPE string.
 
-  lv_filename = p_file.
+  FIELD-SYMBOLS: <lt_data> TYPE STANDARD TABLE,
+                 <ls_row>  TYPE any,
+                 <lv_val>  TYPE any.
 
-  CALL FUNCTION 'TEXT_CONVERT_XLS_TO_SAP'
+  " 1. Read File to XSTRING (Avoids Truncation of TEXT_CONVERT_...)
+  cl_gui_frontend_services=>gui_upload(
     EXPORTING
-      i_line_header        = 'X'
-      i_tab_raw_data       = lt_raw_data
-      i_filename           = lv_filename
-    TABLES
-      i_tab_converted_data = gt_excel_raw
-    EXCEPTIONS
-      conversion_failed    = 1
-      OTHERS               = 2.
+      filename   = gv_file
+      filetype   = 'BIN'
+    IMPORTING
+      filelength = lv_len
+    CHANGING
+      data_tab   = lt_bin
+    EXCEPTIONS OTHERS = 1 ).
 
   IF sy-subrc <> 0.
-    MESSAGE 'Error uploading file' TYPE 'E'.
+    MESSAGE 'Upload Failed' TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
   ENDIF.
+
+  CALL FUNCTION 'SCMS_BINARY_TO_XSTRING'
+    EXPORTING
+      input_length = lv_len
+    TABLES
+      binary_tab   = lt_bin
+    IMPORTING
+      buffer       = lv_xstring.
+
+  " 2. Parse Excel using CL_FDT_XL_SPREADSHEET
+  TRY.
+      CREATE OBJECT lo_excel
+        EXPORTING
+          document_name = gv_file
+          xdocument     = lv_xstring.
+
+      lo_excel->if_fdt_doc_spreadsheet~get_worksheet_names(
+        IMPORTING worksheet_names = lt_worksheets ).
+
+      IF lt_worksheets IS INITIAL.
+        MESSAGE 'No worksheets found' TYPE 'S' DISPLAY LIKE 'E'.
+        RETURN.
+      ENDIF.
+
+      READ TABLE lt_worksheets INTO DATA(lv_sheet) INDEX 1.
+
+      lr_data = lo_excel->if_fdt_doc_spreadsheet~get_itab_from_worksheet(
+                  worksheet_name = lv_sheet ).
+
+      ASSIGN lr_data->* TO <lt_data>.
+
+      LOOP AT <lt_data> INTO <ls_row>.
+        IF sy-tabix = 1. CONTINUE. ENDIF. " Header
+
+        CLEAR: gs_final, lv_hex_raw.
+        
+        " Map Columns dynamically
+        ASSIGN COMPONENT 1 OF STRUCTURE <ls_row> TO <lv_val>.
+        IF sy-subrc = 0. gs_final-col_a = <lv_val>. ENDIF.
+
+        ASSIGN COMPONENT 2 OF STRUCTURE <ls_row> TO <lv_val>.
+        IF sy-subrc = 0. lv_hex_raw = <lv_val>. ENDIF.
+
+        ASSIGN COMPONENT 3 OF STRUCTURE <ls_row> TO <lv_val>.
+        IF sy-subrc = 0. 
+           IF strlen( lv_hex_raw ) < 20 AND strlen( <lv_val> ) > 20.
+             lv_hex_raw = <lv_val>. " Use Col 3 if Col 2 is empty/short
+           ELSE.
+             gs_final-col_c = <lv_val>.
+           ENDIF.
+        ENDIF.
+
+        " 3. Process Hex
+        PERFORM f_convert_hex USING lv_hex_raw CHANGING gs_final.
+        
+        APPEND gs_final TO gt_final.
+      ENDLOOP.
+
+    CATCH cx_root.
+      MESSAGE 'Excel Parse Error' TYPE 'S' DISPLAY LIKE 'E'.
+  ENDTRY.
 ENDFORM.
 
 *&---------------------------------------------------------------------*
-*& Form f_process_data
+*& Form f_convert_hex
 *&---------------------------------------------------------------------*
-FORM f_process_data.
-  DATA: ls_excel       LIKE LINE OF gt_excel_raw,
-        lv_hex_string  TYPE string,
-        lv_clean_hex   TYPE string,
-        lv_xstring     TYPE xstring,
-        lv_xml_raw     TYPE string,
-        lv_xml_pretty  TYPE string,
-        lv_len         TYPE i,
-        lv_idx         TYPE i,
-        lv_char        TYPE c,
-        lo_ixml        TYPE REF TO if_ixml,
-        lo_stream_factory TYPE REF TO if_ixml_stream_factory,
-        lo_document    TYPE REF TO if_ixml_document,
-        lo_parser      TYPE REF TO if_ixml_parser,
-        lo_renderer    TYPE REF TO if_ixml_renderer,
-        lo_istream     TYPE REF TO if_ixml_istream,
-        lo_ostream     TYPE REF TO if_ixml_ostream,
-        lo_error       TYPE REF TO if_ixml_parse_error,
-        lv_rc          TYPE i.
+FORM f_convert_hex USING pv_hex TYPE string CHANGING ps_out TYPE ty_final.
+  DATA: lv_clean   TYPE string,
+        lv_xstr    TYPE xstring,
+        lv_xml_raw TYPE string,
+        lv_xml_pretty TYPE string,
+        lo_ixml    TYPE REF TO if_ixml,
+        lo_sf      TYPE REF TO if_ixml_stream_factory,
+        lo_doc     TYPE REF TO if_ixml_document,
+        lo_parser  TYPE REF TO if_ixml_parser,
+        lo_render  TYPE REF TO if_ixml_renderer,
+        lo_out     TYPE REF TO if_ixml_ostream,
+        lo_in      TYPE REF TO if_ixml_istream,
+        lo_err     TYPE REF TO if_ixml_parse_error.
 
-  " Initialize iXML Factory
-  lo_ixml = cl_ixml=>create( ).
-  lo_stream_factory = lo_ixml->create_stream_factory( ).
+  IF pv_hex IS INITIAL. RETURN. ENDIF.
 
-  LOOP AT gt_excel_raw INTO ls_excel.
-    CLEAR: gs_final, lv_hex_string, lv_clean_hex, lv_xstring, lv_xml_raw, lv_xml_pretty.
-    
-    gs_final-col_a = ls_excel-col_a.
-    gs_final-col_c = ls_excel-col_c.
+  " Clean
+  lv_clean = pv_hex.
+  REPLACE ALL OCCURRENCES OF REGEX '[^0-9A-Fa-f]' IN lv_clean WITH ''.
+  
+  IF lv_clean IS INITIAL. ps_out-status = 'No Valid Hex'. RETURN. ENDIF.
 
-    " Identify Hex Column
-    IF strlen( ls_excel-col_b ) > 10.
-      lv_hex_string = ls_excel-col_b.
-    ELSEIF strlen( ls_excel-col_c ) > 10.
-      lv_hex_string = ls_excel-col_c.
-    ENDIF.
+  TRY.
+      lv_xstr = lv_clean.
 
-    IF lv_hex_string IS NOT INITIAL.
-      " Clean Hex String
-      lv_len = strlen( lv_hex_string ).
-      DO lv_len TIMES.
-        lv_idx = sy-index - 1.
-        lv_char = lv_hex_string+lv_idx(1).
-        IF lv_char CA '0123456789ABCDEFabcdef'.
-          CONCATENATE lv_clean_hex lv_char INTO lv_clean_hex.
-        ENDIF.
-      ENDDO.
-
-      IF lv_clean_hex IS NOT INITIAL.
-        TRY.
-            " 1. Hex -> XString
-            lv_xstring = lv_clean_hex.
-
-            " 2. Direct Parsing from XSTRING
-            " This avoids encoding mismatch errors (e.g. BOMs or UTF-8 header vs ABAP String)
-            lo_document = lo_ixml->create_document( ).
-            lo_istream  = lo_stream_factory->create_istream_xstring( lv_xstring ).
-            lo_parser   = lo_ixml->create_parser( stream_factory = lo_stream_factory
-                                                  istream        = lo_istream
-                                                  document       = lo_document ).
-            lv_rc = lo_parser->parse( ).
-
-            IF lv_rc = 0.
-              " Success: Pretty Print
-              lo_ostream  = lo_stream_factory->create_ostream_cstring( lv_xml_pretty ).
-              lo_renderer = lo_ixml->create_renderer( ostream  = lo_ostream
-                                                      document = lo_document ).
-              
-              lo_renderer->set_normalizing( 'X' ).
-              lo_renderer->render( ).
-              
-              gs_final-converted = lv_xml_pretty.
-              gs_final-status    = 'Success'.
-            ELSE.
-              " Parse Error: Fallback to Raw Conversion for display
-              " We use CL_BCS_CONVERT or similar as fallback
-              TRY.
-                  lv_xml_raw = cl_bcs_convert=>xstring_to_string(
-                                 iv_xstring  = lv_xstring
-                                 iv_codepage = '4110' ). " UTF-8
-                  
-                  gs_final-converted = lv_xml_raw.
-                  
-                  " Capture Specific Error
-                  lo_error = lo_parser->get_error( index = 0 ).
-                  IF lo_error IS BOUND.
-                    gs_final-status = lo_error->get_reason( ).
-                  ELSE.
-                    gs_final-status = 'XML Parse Error'.
-                  ENDIF.
-                CATCH cx_root.
-                  gs_final-status = 'Fatal Error'.
-              ENDTRY.
-            ENDIF.
-
-          CATCH cx_root.
-            gs_final-status = 'Conversion Failed'.
-        ENDTRY.
+      lo_ixml = cl_ixml=>create( ).
+      lo_sf   = lo_ixml->create_stream_factory( ).
+      
+      " Parse Direct from XString (Robust)
+      lo_doc = lo_ixml->create_document( ).
+      lo_in  = lo_sf->create_istream_xstring( lv_xstr ).
+      lo_parser = lo_ixml->create_parser( stream_factory = lo_sf
+                                          istream        = lo_in
+                                          document       = lo_doc ).
+      
+      IF lo_parser->parse( ) = 0.
+        lo_out = lo_sf->create_ostream_cstring( lv_xml_pretty ).
+        lo_render = lo_ixml->create_renderer( ostream = lo_out document = lo_doc ).
+        lo_render->set_normalizing( 'X' ).
+        lo_render->render( ).
+        ps_out-converted = lv_xml_pretty.
+        ps_out-status = 'Success'.
       ELSE.
-        gs_final-status = 'No Valid Hex'.
+        " Fallback: FM
+        CALL FUNCTION 'HR_RU_CONVERT_HEX_TO_STRING'
+          EXPORTING xstring = lv_xstr
+          IMPORTING cstring = lv_xml_raw.
+        ps_out-converted = lv_xml_raw.
+        
+        lo_err = lo_parser->get_error( index = 0 ).
+        IF lo_err IS BOUND.
+           ps_out-status = lo_err->get_reason( ).
+        ELSE.
+           ps_out-status = 'Parse Error'.
+        ENDIF.
       ENDIF.
-    ENDIF.
 
-    APPEND gs_final TO gt_final.
-  ENDLOOP.
+    CATCH cx_root.
+      ps_out-status = 'Conversion Exception'.
+  ENDTRY.
 ENDFORM.
 
 *&---------------------------------------------------------------------*
 *& Form f_display_alv
 *&---------------------------------------------------------------------*
 FORM f_display_alv.
-  DATA: lo_alv TYPE REF TO cl_salv_table,
-        lo_msg TYPE REF TO cx_salv_msg,
-        lo_cols TYPE REF TO cl_salv_columns_table,
-        lo_col  TYPE REF TO cl_salv_column.
-
+  DATA: lo_alv TYPE REF TO cl_salv_table.
   TRY.
-      cl_salv_table=>factory(
-        IMPORTING
-          r_salv_table = lo_alv
-        CHANGING
-          t_table      = gt_final
-      ).
-
-      lo_cols = lo_alv->get_columns( ).
-      lo_cols->set_optimize( 'X' ).
+      cl_salv_table=>factory( IMPORTING r_salv_table = lo_alv CHANGING t_table = gt_final ).
+      lo_alv->get_columns( )->set_optimize( 'X' ).
       
+      " Increase column width for readability
       TRY.
-          lo_col = lo_cols->get_column( 'CONVERTED' ).
-          lo_col->set_long_text( 'Converted Content' ).
-          lo_col->set_medium_text( 'Content' ).
-          lo_col->set_output_length( 100 ). 
-      CATCH cx_salv_not_found.
+        DATA(lo_col) = lo_alv->get_columns( )->get_column( 'CONVERTED' ).
+        lo_col->set_output_length( 100 ).
+      CATCH cx_root.
       ENDTRY.
 
       lo_alv->display( ).
-
-    CATCH cx_salv_msg INTO lo_msg.
-      MESSAGE lo_msg TYPE 'E'.
+    CATCH cx_root.
   ENDTRY.
 ENDFORM.
