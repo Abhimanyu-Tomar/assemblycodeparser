@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Hex->String (OO Class), Pretty Print
+*& Description: Upload Excel, Hex->String (OO Correct), Pretty Print
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -177,14 +177,16 @@ FORM f_process_data.
             lv_xstring = lv_clean_hex.
 
             " 2. XString -> String (UTF-8) using OO Class
+            " Correct Usage: Pass INPUT to CREATE
             lo_conv = cl_abap_conv_in_ce=>create( 
+                        input       = lv_xstring 
                         encoding    = 'UTF-8' 
                         replacement = '?' 
                         ignore_cerr = 'X' ).
             
+            " READ simply retrieves the data
             lo_conv->read( 
-                EXPORTING input = lv_xstring 
-                IMPORTING data  = lv_xml_raw ).
+                IMPORTING data = lv_xml_raw ).
 
             IF lv_xml_raw IS NOT INITIAL.
               " 3. Pretty Print XML using iXML
