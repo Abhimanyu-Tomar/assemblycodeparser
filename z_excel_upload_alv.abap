@@ -1,7 +1,7 @@
 *&---------------------------------------------------------------------*
 *& Report Z_EXCEL_UPLOAD_ALV
 *&---------------------------------------------------------------------*
-*& Description: Upload Excel, Hex -> Base64 (SSFC_BASE64_ENCODE)
+*& Description: Upload Excel, Hex->String (OO Class), Pretty Print
 *&---------------------------------------------------------------------*
 REPORT z_excel_upload_alv.
 
@@ -17,7 +17,7 @@ TYPES: BEGIN OF ty_excel_raw,
 * Output Structure
 TYPES: BEGIN OF ty_final,
          col_a     TYPE string,
-         converted TYPE string,      " Base64 Output
+         converted TYPE string,      " Formatted XML
          col_c     TYPE string,
          status    TYPE string,
        END OF ty_final.
@@ -128,18 +128,32 @@ FORM f_process_data.
         lv_hex_string  TYPE string,
         lv_clean_hex   TYPE string,
         lv_xstring     TYPE xstring,
-        lv_base64      TYPE string,
+        lv_xml_raw     TYPE string,
+        lv_xml_pretty  TYPE string,
         lv_len         TYPE i,
         lv_idx         TYPE i,
-        lv_char        TYPE c.
+        lv_char        TYPE c,
+        lo_conv        TYPE REF TO cl_abap_conv_in_ce,
+        lo_ixml        TYPE REF TO if_ixml,
+        lo_stream_factory TYPE REF TO if_ixml_stream_factory,
+        lo_document    TYPE REF TO if_ixml_document,
+        lo_parser      TYPE REF TO if_ixml_parser,
+        lo_renderer    TYPE REF TO if_ixml_renderer,
+        lo_istream     TYPE REF TO if_ixml_istream,
+        lo_ostream     TYPE REF TO if_ixml_ostream,
+        lv_rc          TYPE i.
+
+  " Initialize iXML Factory
+  lo_ixml = cl_ixml=>create( ).
+  lo_stream_factory = lo_ixml->create_stream_factory( ).
 
   LOOP AT gt_excel_raw INTO ls_excel.
-    CLEAR: gs_final, lv_hex_string, lv_clean_hex, lv_xstring, lv_base64.
+    CLEAR: gs_final, lv_hex_string, lv_clean_hex, lv_xstring, lv_xml_raw, lv_xml_pretty.
     
     gs_final-col_a = ls_excel-col_a.
     gs_final-col_c = ls_excel-col_c.
 
-    " 1. Identify Hex Column
+    " Identify Hex Column
     IF strlen( ls_excel-col_b ) > 10.
       lv_hex_string = ls_excel-col_b.
     ELSEIF strlen( ls_excel-col_c ) > 10.
@@ -147,7 +161,7 @@ FORM f_process_data.
     ENDIF.
 
     IF lv_hex_string IS NOT INITIAL.
-      " 2. Clean Hex String (keep only 0-9, A-F)
+      " Clean Hex String
       lv_len = strlen( lv_hex_string ).
       DO lv_len TIMES.
         lv_idx = sy-index - 1.
@@ -159,26 +173,58 @@ FORM f_process_data.
 
       IF lv_clean_hex IS NOT INITIAL.
         TRY.
+            " 1. Hex -> XString
             lv_xstring = lv_clean_hex.
 
-            " 3. Convert XSTRING (Binary) to BASE64 String
-            CALL FUNCTION 'SSFC_BASE64_ENCODE'
-              EXPORTING
-                bindata = lv_xstring
-              IMPORTING
-                b64data = lv_base64
-              EXCEPTIONS
-                OTHERS  = 1.
+            " 2. XString -> String (UTF-8) using OO Class
+            lo_conv = cl_abap_conv_in_ce=>create( 
+                        encoding    = 'UTF-8' 
+                        replacement = '?' 
+                        ignore_cerr = 'X' ).
+            
+            lo_conv->read( 
+                EXPORTING input = lv_xstring 
+                IMPORTING data  = lv_xml_raw ).
 
-            IF sy-subrc = 0.
-              gs_final-converted = lv_base64.
-              gs_final-status    = 'Success (Base64)'.
+            IF lv_xml_raw IS NOT INITIAL.
+              " 3. Pretty Print XML using iXML
+              " Create Document
+              lo_document = lo_ixml->create_document( ).
+              
+              " Create Input Stream from raw XML string
+              lo_istream  = lo_stream_factory->create_istream_string( lv_xml_raw ).
+              
+              " Create Parser
+              lo_parser   = lo_ixml->create_parser( stream_factory = lo_stream_factory
+                                                    istream        = lo_istream
+                                                    document       = lo_document ).
+              
+              " Parse
+              lv_rc = lo_parser->parse( ).
+
+              IF lv_rc = 0.
+                " Render to String
+                lo_ostream  = lo_stream_factory->create_ostream_cstring( lv_xml_pretty ).
+                lo_renderer = lo_ixml->create_renderer( ostream  = lo_ostream
+                                                        document = lo_document ).
+                
+                " Enable Pretty Printing
+                lo_renderer->set_normalizing( 'X' ).
+                lo_renderer->render( ).
+                
+                gs_final-converted = lv_xml_pretty.
+                gs_final-status    = 'Parsed & Formatted'.
+              ELSE.
+                " Fallback to raw string
+                gs_final-converted = lv_xml_raw.
+                gs_final-status    = 'Raw XML (Parsing Failed)'.
+              ENDIF.
             ELSE.
-              gs_final-status    = 'Base64 Encode Failed'.
+               gs_final-status = 'Empty Result'.
             ENDIF.
 
           CATCH cx_root.
-            gs_final-status = 'Hex Conversion Error'.
+            gs_final-status = 'Conversion Failed'.
         ENDTRY.
       ELSE.
         gs_final-status = 'No Valid Hex'.
@@ -211,8 +257,8 @@ FORM f_display_alv.
       
       TRY.
           lo_col = lo_cols->get_column( 'CONVERTED' ).
-          lo_col->set_long_text( 'Base64 Encoded String' ).
-          lo_col->set_medium_text( 'Base64' ).
+          lo_col->set_long_text( 'Converted Content' ).
+          lo_col->set_medium_text( 'Content' ).
           lo_col->set_output_length( 100 ). 
       CATCH cx_salv_not_found.
       ENDTRY.
